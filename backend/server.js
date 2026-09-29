@@ -13,11 +13,14 @@ const express = require("express");
 const cors    = require("cors");
 const { Server } = require("socket.io");
 const Anthropic  = require("@anthropic-ai/sdk");
+const deck       = require("./deck");
 
 const PORT          = process.env.PORT || 5000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const MODEL         = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 const HOST_KEY      = process.env.HOST_KEY || "rise2026";   // reclaims the dashboard if the laptop is lost
+// Optional: comma-separated names that must never appear in a deck (e.g. an acquiring company).
+const REDACT_TERMS  = String(process.env.REDACT_TERMS || "").split(",").map(t => t.trim()).filter(Boolean);
 const DATA_DIR      = path.join(__dirname, ".data");
 const DATA_FILE     = path.join(DATA_DIR, "sessions.json");
 
@@ -168,7 +171,7 @@ function aggregate(s) {
 const app    = express();
 const server = http.createServer(app);
 
-app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(cors({ origin: CLIENT_ORIGIN, exposedHeaders: ["Content-Disposition"] }));
 app.use(express.json({ limit: "2mb" }));
 
 const io = new Server(server, {
@@ -292,6 +295,8 @@ io.on("connection", (socket) => {
     s.responses    = {};
     s.liveActivity = null;
     s.liveRound    = 1;
+    s.decks        = {};
+    dropDecks(code);
     io.to(roomOf(code)).emit("session:reset");   // tells phones to clear their local "done" list
     broadcastState(code);
     broadcastResponses(code);
@@ -302,6 +307,7 @@ io.on("connection", (socket) => {
     const s = sessions[code];
     if (!isHost(s, token)) return;
     io.to(roomOf(code)).emit("session:ended");
+    dropDecks(code);
     delete sessions[code];
     saveStore();
     io.emit("lobby:status", { active: false, code: null });
@@ -383,161 +389,285 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, sessions: Object.keys(sessions).length, model: MODEL, uptime: Math.round(process.uptime()) });
 });
 
+/** Facilitator-only: every answer, including Activity 4 by function. */
 app.get("/api/sessions/:code", (req, res) => {
-  const s = sessions[req.params.code.toUpperCase()];
+  const s = sessions[String(req.params.code).toUpperCase()];
   if (!s) return res.status(404).json({ error: "Not found" });
+  if (!isHost(s, req.query.token)) return res.status(403).json({ error: "Facilitator only" });
   res.json({ ...publicState(s), data: aggregate(s) });
 });
 
-/** CSV export — one row per leader, for any activity. */
+/** CSV export, one row per leader. Facilitator-only: /api/sessions/ABCD/export/4?token=... */
 app.get("/api/sessions/:code/export/:activityId", (req, res) => {
-  const s = sessions[req.params.code.toUpperCase()];
+  const s = sessions[String(req.params.code).toUpperCase()];
   const id = Number(req.params.activityId);
   if (!s || !SCHEMA[id]) return res.status(404).send("Not found");
+  if (!isHost(s, req.query.token)) return res.status(403).send("Facilitator only");
 
   const schema = SCHEMA[id];
   const keys   = schema.questions.map(q => q.key);
   const header = [...(schema.anonymous ? [] : ["name"]), ...keys];
-
   const esc = (v) => {
     if (Array.isArray(v)) v = v.map(k => BEHAVIOUR_LABELS[k] || COMMITMENT_LABELS[k] || k).join("; ");
     return `"${String(v ?? "").replace(/"/g, '""')}"`;
   };
-
   const rows = Object.values(s.responses[id] || {}).map(r =>
     [...(schema.anonymous ? [] : [r.name]), ...keys.map(k => r.answers?.[k])].map(esc).join(",")
   );
-
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="activity-${id}-${s.code}.csv"`);
   res.send([header.join(","), ...rows].join("\n"));
 });
 
-/* ── Activity 4 → "What you told us" deck ──────────────────────────────────── */
-const DECK_SYSTEM = `You are helping Carnelian, a consulting firm, run a live leadership session for foodpanda Pakistan. You are given responses from 8 to 11 senior leaders, one per function, collected in the room a few minutes ago.
+/* ─────────────────────────────────────────────────────────────────────────────
+   5b · PRESENTATIONS
+   Numbers come from the data (deck.js). Claude only writes the wording.
+   "a4"      → the 7-slide "What you told us" deck for the break
+   "session" → the full results deck, all seven activities
+───────────────────────────────────────────────────────────────────────────── */
+const deckBuffers = new Map();                 // `${code}:${kind}` → Buffer (rebuilt on demand after a restart)
+function dropDecks(code) { for (const k of [...deckBuffers.keys()]) if (k.startsWith(code + ":")) deckBuffers.delete(k); }
 
-Produce a 5-line plain-text sanity summary, then a structured 7-slide specification.
+const escRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function redactText(str, replacement) {
+  let out = String(str ?? "");
+  for (const t of REDACT_TERMS) out = out.replace(new RegExp(`\\b${escRe(t)}\\b`, "gi"), replacement);
+  return out;
+}
+function redactDeep(v, replacement = "the pending transaction") {
+  if (typeof v === "string") return redactText(v, replacement);
+  if (Array.isArray(v)) return v.map(x => redactDeep(x, replacement));
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x, replacement)]));
+  return v;
+}
+/** Leaders' own words: keep them, but never show a redacted name. */
+function redactStats(st) {
+  if (!REDACT_TERMS.length) return st;
+  const r = (x) => redactDeep(x, "[company]");
+  return { ...st, a1: r(st.a1), a6: r(st.a6), a7: r(st.a7), a4: { ...st.a4, rows: r(st.a4.rows), perFunction: r(st.a4.perFunction) } };
+}
 
-RULES
-- Use only what is in the data. Do not invent examples, numbers or themes.
-- Every count must match the data exactly.
-- Headlines are full sentences that state the finding, not labels. "Prioritisation and ownership lead across almost every function", not "Top behaviours".
-- About 25 words of body text per slide at most. This goes on a screen for senior leaders.
-- Never show a person's name. Function labels only on slides 3 and 5. Slides 4 and 7 carry no function labels.
-- If anyone mentions an acquisition or names an acquiring company, write "the pending transaction". Never name the company.
+function extractJSON(text) {
+  const t = String(text || "").replace(/```json|```/gi, "");
+  const start = t.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < t.length; i++) {
+    const ch = t[i];
+    if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) { try { return JSON.parse(t.slice(start, i + 1)); } catch { return null; } }
+  }
+  return null;
+}
+
+async function askJSON(system, user, maxTokens) {
+  let lastErr = "no response";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const msg = await anthropic.messages.create({ model: MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] });
+      const j = extractJSON(msg.content.map(c => c.text || "").join(""));
+      if (j) return j;
+      lastErr = "reply was not valid JSON";
+    } catch (e) { lastErr = e.message; }
+  }
+  throw new Error(lastErr);
+}
+
+const HOUSE_RULES = `- Use only what is in the answers. Do not invent examples, numbers or themes.
+- Headlines are full sentences that state the finding, not labels.
+- Never include a person's name.
+- Never name any company involved in an acquisition or sale. If anyone mentions it, write "the pending transaction".
 - Short verbatim phrases under 12 words are allowed where they sharpen a point. Fix obvious typos.
-- Plain, natural British English. No em dashes. No consultant jargon (leverage, unlock, synergy). No "it's not just X, it's Y".
-- Only include functions that actually responded.
+- Plain, natural British English. No em dashes. No consultant jargon ("leverage", "unlock", "synergy"). No "it's not just X, it's Y" phrasing.`;
 
-Return ONLY valid JSON, no markdown fences, in exactly this shape:
+const A4_SYSTEM = `You are helping Carnelian, a consulting firm, run a live leadership session for foodpanda Pakistan. You are given answers from senior leaders, one per function, collected in the room. You write the wording for a 7-slide summary called "What you told us". Numbers, charts and layout are produced elsewhere from the data: you only write text.
+
+Rules:
+${HOUSE_RULES}
+- The fields for slides 4 and 7 must not contain any function name.
+
+Return ONLY valid JSON, no markdown, in exactly this shape:
 {
-  "summary": "Five short lines separated by newlines, for the facilitator to sanity check.",
-  "n": 0,
-  "functions": 0,
-  "slides": [
-    { "n": 1, "type": "title", "title": "What you told us", "subtitle": "[n] leaders, [n] functions, a few minutes ago" },
-    { "n": 2, "type": "bars", "headline": "One sentence naming the top one or two behaviours.",
-      "bars": [ { "label": "Behaviour name", "value": 0, "emphasis": true } ],
-      "note": "One line if a behaviour was picked by nobody, else empty string." },
-    { "n": 3, "type": "table", "headline": "One sentence on the overall pattern.",
-      "columns": ["Function", "Top two behaviours", "What good looks like"],
-      "rows": [ ["Function", "Behaviour A, Behaviour B", "Max eight words"] ] },
-    { "n": 4, "type": "themes", "headline": "One sentence naming the most common pattern in where decisions get stuck.",
-      "themes": [ { "title": "Short bold title", "line": "One line of explanation.", "count": "3 functions described this" } ] },
-    { "n": 5, "type": "outliers", "headline": "A few needs sit outside the common pattern",
-      "items": [ { "function": "Function", "need": "The need in one line." } ],
-      "fallback": "Use this line instead if there are no real outliers, else empty string." },
-    { "n": 6, "type": "discussion", "headline": "How do we cater to these?",
-      "questions": ["Is this a need for one function, or an early signal for all of us?",
-                    "Where does it sit: something people learn, something managers do, or something the organisation changes?"] },
-    { "n": 7, "type": "messages", "headline": "One sentence naming the strongest theme in what teams are waiting to hear.",
-      "messages": ["Grouped message, no function label."],
-      "footer": "We'll build on these next." }
-  ]
+  "summary": "Five short lines separated by \\n, for the facilitator to sanity check before sharing.",
+  "s3_headline": "One sentence, at most 9 words, on the overall pattern across functions.",
+  "s3_good": { "<exact function name>": "What good looks like in that function, at most 6 words, drawn from its example" },
+  "s4_headline": "One sentence, at most 12 words, naming the most common way decisions got stuck (question 5).",
+  "s4_themes": [ { "title": "At most 4 words", "line": "One line of explanation, at most 12 words", "functions": 3 } ],
+  "s5_outliers": [ { "function": "<exact function name>", "need": "The need in one line, at most 12 words" } ],
+  "s5_none_line": "One line to use if there are no real outliers, otherwise an empty string.",
+  "s7_headline": "One sentence, at most 12 words, naming the strongest theme in what teams need to hear (question 6).",
+  "s7_messages": ["Three to five grouped messages, each at most 14 words, no function names."]
+}
+s3_good must contain exactly one entry for every function listed, using the function name exactly as given.
+s4_themes: two or three themes; "functions" is the whole number of functions that described it.
+s5_outliers: zero to three genuine outliers, from question 3 (a missing behaviour or skill) or an unusual situation in question 5. Use the exact function name.`;
+
+function a4Prompt(st) {
+  const counts = deck.BEHAVIOURS.map(b => `${b.label}: ${st.a4.behaviourCounts[b.key]}`).join("\n");
+  const leaders = st.a4.rows.map((r, i) => [
+    `LEADER ${i + 1}`,
+    `Function: ${r.fn}`,
+    `Two behaviours that matter most: ${r.behaviours.join(" + ")}`,
+    `Missing from the list: ${r.missing || "(left blank)"}`,
+    `What good looks like: ${r.good}`,
+    `Where priorities clashed or a decision got stuck: ${r.stuck}`,
+    `Message their team needs to hear: ${r.message}`,
+  ].join("\n")).join("\n\n");
+  return `NUMBER OF LEADERS: ${st.a4.n}
+FUNCTIONS (${st.a4.nf}): ${st.a4.functions.join(", ")}
+
+BEHAVIOUR COUNTS (already tallied):
+${counts}
+
+ANSWERS:
+
+${leaders}`;
 }
 
-Slide 2 must list all six behaviours highest first, with the top two marked emphasis true.
-Slide 6 must carry exactly the two questions given above, unchanged.`;
+const SESSION_SYSTEM = `You write short wording for a results deck from a foodpanda Pakistan leadership offsite run by Carnelian.
 
-function digest(responses = []) {
-  return responses.map((r, i) => {
-    const a = r.answers || {};
-    const behaviours = (a.behaviours || []).map(k => BEHAVIOUR_LABELS[k] || k).join(" + ");
-    return [
-      `LEADER ${i + 1}`,
-      `Function: ${a.fn || "Not given"}`,
-      `Two behaviours that matter most: ${behaviours || "Not given"}`,
-      `Missing from the list: ${a.missing?.trim() || "(left blank)"}`,
-      `What good looks like: ${a.good || "Not given"}`,
-      `Where a decision got stuck: ${a.stuck || "Not given"}`,
-      `Message their team needs to hear: ${a.message || "Not given"}`,
-    ].join("\n");
-  }).join("\n\n———\n\n");
+Rules:
+${HOUSE_RULES}
+
+Return ONLY valid JSON, no markdown, in exactly this shape:
+{
+  "a1_headline": "One sentence, at most 12 words, stating the common thread in the 2027 headlines.",
+  "a1_picks": [0, 1, 2],
+  "a6_headline": "One sentence, at most 12 words, naming the strongest theme in the questions teams will ask.",
+  "a7_headline": "One sentence, at most 12 words, naming the most common kind of change leaders committed to."
+}
+a1_picks: the numbers of the three strongest, most distinct headlines for the closing slide; prefer shorter ones.
+Use an empty string for any section that has no answers.`;
+
+function sessionPrompt(st) {
+  const list = (arr) => (arr.length ? arr.map((t, i) => `${i}. ${t}`).join("\n") : "(no answers)");
+  return `ACTIVITY 1 · HEADLINES FOR SEPTEMBER 2027:
+${list(st.a1)}
+
+ACTIVITY 6 · HARDEST QUESTIONS TEAMS WILL ASK:
+${list(st.a6)}
+
+ACTIVITY 7 · ONE CHANGE EACH LEADER WILL MAKE IN 30 DAYS:
+${list(st.a7.map(x => x.text))}`;
 }
 
-app.post("/api/ai/deck", async (req, res) => {
+/** What the facilitator should check before the deck goes on screen. */
+function qaReport(kind, st, ai, result, aiErrors) {
+  const qa = [];
+  const add = (status, label, detail = "") => qa.push({ status, label, detail });
+  const a4 = st.a4;
+
+  if (a4.n) {
+    const a4ai = kind === "a4" ? ai : (ai.a4 || {});
+    const a4Slides = result.sections.find(x => x.id === 4)?.slides || 0;
+    add("pass", "Slide 1 count matches the data", `${a4.n} leaders, ${a4.nf} functions`);
+    add(a4.picks === a4.n * 2 ? "pass" : "warn", "Behaviour chart totals twice the leaders",
+      `${a4.picks} picks from ${a4.n} leaders${a4.picks === a4.n * 2 ? "" : ", someone did not pick exactly two"}`);
+    add(a4Slides === 7 ? "pass" : "warn", "“What you told us” is exactly 7 slides",
+      a4Slides === 7 ? "" : `${a4Slides} slides: the function table needed a second slide to stay readable`);
+    const aiText = JSON.stringify(a4ai);
+    const names = st.names.filter(n => new RegExp(`\\b${escRe(n)}\\b`, "i").test(aiText));
+    add(names.length ? "warn" : "pass", "No leader names in “What you told us”",
+      names.length ? `Mentioned: ${names.join(", ")}. Regenerate or edit before sharing.` : "");
+    const s47 = JSON.stringify([a4ai.s4_headline, a4ai.s4_themes, a4ai.s7_headline, a4ai.s7_messages]);
+    const fns = a4.functions.filter(f => f !== "Other" && new RegExp(`\\b${escRe(f)}\\b`, "i").test(s47));
+    add(fns.length ? "warn" : "pass", "No function labels on slides 4 and 7", fns.length ? `Mentioned: ${fns.join(", ")}` : "");
+    if (REDACT_TERMS.length) add("pass", "Company names redacted", REDACT_TERMS.join(", "));
+  }
+  const jargon = ["leverage", "unlock", "synergy", "synergies"].filter(j => new RegExp(`\\b${j}`, "i").test(JSON.stringify(ai)));
+  add(jargon.length ? "warn" : "pass", "No consultant jargon", jargon.join(", "));
+
+  const cut = result.warnings.filter(w => /shortened/.test(w));
+  add(cut.length ? "warn" : "pass", "Every piece of text fits its box", cut.join("; "));
+
+  const small = {};
+  result.small.forEach(x => { const k = `Slide ${x.slide}: ${x.label.replace(/ text$/, "")}`; small[k] = Math.min(small[k] || 99, x.pt); });
+  const smallList = Object.entries(small).map(([k, pt]) =>
+    `${k} at ${pt}pt${/table/.test(k) ? ` (all ${a4.nf} functions on one slide, keeping the 7-slide structure)` : ""}`);
+  add(smallList.length ? "info" : "pass", "Body text at 18pt or larger", smallList.join("; "));
+
+  result.warnings.filter(w => !/shortened/.test(w)).forEach(w => add("info", w));
+  if (result.skipped.length) add("info", "Left out, no answers", result.skipped.map(id => `Activity ${id}`).join(", "));
+  aiErrors.forEach(e => add("warn", "AI wording unavailable, fallback wording used", e));
+  return qa;
+}
+
+const fileName = (kind, s) => {
+  const d = new Date(s.startedAt || Date.now()).toISOString().slice(0, 10);
+  return kind === "a4" ? `What-you-told-us_${d}.pptx` : `RISE-Alignment_Leadership-Offsite_${d}.pptx`;
+};
+
+/** Generate (or regenerate) a deck. Facilitator only. */
+app.post("/api/deck/generate", async (req, res) => {
+  const { code, token, kind = "session", fresh = false } = req.body || {};
+  const s = sessions[code];
+  if (!isHost(s, token)) return res.status(403).json({ error: "Only the facilitator can generate a presentation." });
+  if (!["a4", "session"].includes(kind)) return res.status(400).json({ error: "Unknown deck" });
+
+  const t0 = Date.now();
   try {
-    const responses = req.body?.responses || [];
-    if (!responses.length) return res.status(400).json({ error: "No responses to analyse yet." });
+    const st = redactStats(deck.computeStats(s));
+    const hasAny = st.a1.length || st.a2.q1.n || st.a3.some(r => r.n) || st.a4.n || st.a5.n || st.a6.length || st.a7.length;
+    if (kind === "a4" && !st.a4.n) return res.status(400).json({ error: "No answers for Activity 4 yet." });
+    if (kind === "session" && !hasAny) return res.status(400).json({ error: "No answers yet. Run at least one activity first." });
 
-    const functions = [...new Set(responses.map(r => r.answers?.fn).filter(Boolean))];
-
-    const counts = {};
-    responses.forEach(r => (r.answers?.behaviours || []).forEach(k => { counts[k] = (counts[k] || 0) + 1; }));
-    const countLines = Object.entries(BEHAVIOUR_LABELS)
-      .map(([k, label]) => `${label}: ${counts[k] || 0}`).join("\n");
-
-    const user = [
-      `NUMBER OF LEADERS: ${responses.length}`,
-      `FUNCTIONS REPRESENTED (${functions.length}): ${functions.join(", ") || "none given"}`,
-      ``,
-      `BEHAVIOUR COUNTS (already tallied, use these exact numbers on slide 2):`,
-      countLines,
-      ``,
-      `FULL RESPONSES:`,
-      ``,
-      digest(responses),
-    ].join("\n");
-
-    const msg = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 8000,
-      system: DECK_SYSTEM,
-      messages: [{ role: "user", content: user }],
-    });
-
-    const raw = msg.content[0].text;
-    const start = raw.indexOf("{");
-    let depth = 0, end = -1;
-    for (let i = start; i < raw.length; i++) {
-      if (raw[i] === "{") depth++;
-      else if (raw[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    s.decks = s.decks || {};
+    const aiErrors = [];
+    const fp = deck.a4Fingerprint(st);
+    let a4ai = !fresh && s.decks.a4ai?.fp === fp ? s.decks.a4ai.ai : null;   // reuse the read shown at the break
+    let sessAi = {};
+    const jobs = [];
+    if (st.a4.n && !a4ai) {
+      jobs.push(askJSON(A4_SYSTEM, a4Prompt(st), 6000)
+        .then(j => { a4ai = redactDeep(j); s.decks.a4ai = { fp, ai: a4ai }; })
+        .catch(e => { aiErrors.push(`Activity 4: ${e.message}`); a4ai = {}; }));
     }
-    if (start === -1 || end === -1) throw new Error("Model did not return JSON");
+    if (kind === "session" && (st.a1.length || st.a6.length || st.a7.length)) {
+      jobs.push(askJSON(SESSION_SYSTEM, sessionPrompt(st), 1500)
+        .then(j => { sessAi = redactDeep(j); })
+        .catch(e => aiErrors.push(`Headlines: ${e.message}`)));
+    }
+    await Promise.all(jobs);
 
-    const parsed = JSON.parse(raw.slice(start, end + 1));
-    parsed.n = parsed.n || responses.length;
-    parsed.functions = parsed.functions || functions.length;
+    const ai = kind === "a4" ? (a4ai || {}) : { ...sessAi, a4: a4ai || {} };
+    const result = kind === "a4" ? await deck.buildA4Deck(st, ai) : await deck.buildSessionDeck(st, ai);
+    s.decks[kind] = { st, ai, at: Date.now() };
+    deckBuffers.set(`${code}:${kind}`, result.buffer);
+    saveStore();
 
-    res.json(parsed);
+    const qa = qaReport(kind, st, ai, result, aiErrors);
+    console.log(`[deck]   ${code} — ${kind}, ${result.slides} slides, ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    res.json({
+      ok: true, kind, slides: result.slides, sections: result.sections, skipped: result.skipped,
+      summary: (a4ai && a4ai.summary) ? String(a4ai.summary).split(/\n+/).map(deck.tidy).filter(Boolean).join("\n") : "", qa,
+      seconds: Math.round((Date.now() - t0) / 1000), fileName: fileName(kind, s), generatedAt: s.decks[kind].at,
+    });
   } catch (err) {
-    console.error("Deck error:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("Deck error:", err);
+    res.status(500).json({ error: `Could not build the presentation: ${err.message}` });
   }
 });
 
-/* generic passthrough, handy for one-off prompts during the session */
-app.post("/api/ai/ask", async (req, res) => {
+/** Download the last generated deck. Facilitator only. */
+app.post("/api/deck/file", async (req, res) => {
+  const { code, token, kind = "session" } = req.body || {};
+  const s = sessions[code];
+  if (!isHost(s, token)) return res.status(403).json({ error: "Only the facilitator can download the presentation." });
+  const saved = s.decks?.[kind];
+  if (!saved) return res.status(404).json({ error: "Generate the presentation first." });
   try {
-    const msg = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: Number(req.body?.maxTokens) || 3000,
-      system: req.body?.system || "You are a concise analyst. Plain British English. No em dashes.",
-      messages: [{ role: "user", content: String(req.body?.user || "") }],
-    });
-    res.json({ text: msg.content[0].text });
+    let buf = deckBuffers.get(`${code}:${kind}`);
+    if (!buf) {
+      const r = kind === "a4" ? await deck.buildA4Deck(saved.st, saved.ai) : await deck.buildSessionDeck(saved.st, saved.ai);
+      buf = r.buffer; deckBuffers.set(`${code}:${kind}`, buf);
+    }
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName(kind, s)}"`);
+    res.send(buf);
   } catch (err) {
-    console.error("Ask error:", err.message);
+    console.error("Deck file error:", err);
     res.status(500).json({ error: err.message });
   }
 });

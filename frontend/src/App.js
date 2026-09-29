@@ -3,16 +3,15 @@
    Single-file React app (CRA)  ·  frontend/src/App.js
    ----------------------------------------------------------------------------
    npm i @mui/material @emotion/react @emotion/styled @mui/icons-material \
-         socket.io-client qrcode.react pptxgenjs
+         socket.io-client qrcode.react
 
    public/logo.png            -> Carnelian logo
    public/foodpanda-logo.png  -> foodpanda bear mark (wordmark drawn in code)
 ============================================================================ */
 
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef, useContext, createContext } from "react";
 import { io } from "socket.io-client";
 import { QRCodeSVG } from "qrcode.react";
-import pptxgen from "pptxgenjs";
 import {
   ThemeProvider, createTheme, CssBaseline,
   Box, Typography, Button, TextField, Paper, Chip, Stack,
@@ -34,6 +33,9 @@ import LogoutIcon           from "@mui/icons-material/Logout";
 import RestartAltIcon       from "@mui/icons-material/RestartAlt";
 import DownloadIcon         from "@mui/icons-material/Download";
 import BoltIcon             from "@mui/icons-material/Bolt";
+import SlideshowIcon        from "@mui/icons-material/Slideshow";
+import WarningAmberIcon     from "@mui/icons-material/WarningAmber";
+import InfoOutlinedIcon     from "@mui/icons-material/InfoOutlined";
 
 /* ─────────────────────────────────────────────────────────────────────────────
    1 · BRAND TOKENS
@@ -417,163 +419,137 @@ function Donut({ data, size = 190 }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   6 · PPTX BUILDER  —  "What you told us", 7 slides, 16:9
+   6 · PRESENTATIONS  (built on the server from live data; the browser only downloads)
 ───────────────────────────────────────────────────────────────────────────── */
-const P = { M:"D7136B", MAR:"7A1538", INK:"1C1A22", PINK:"E7C6D0", BLUSH:"FBE4EC", W:"FFFFFF", GREY:"6B6570" };
-const F_HEAD = "Arial", F_BODY = "Calibri";
+const HostCtx = createContext({ code:"", token:"", resetTick:0 });
 
-function pTag(s, text = "WHAT YOU TOLD US", color = P.M) {
-  s.addText(text, { x:0.5, y:0.3, w:5, h:0.24, fontSize:11, bold:true, color, charSpacing:2.6, fontFace:F_HEAD });
+function useDeck(kind) {
+  const host = useContext(HostCtx);
+  const [busy, setBusy] = useState(false);
+  const [res, setRes]   = useState(null);
+  const [err, setErr]   = useState("");
+  const [dl, setDl]     = useState(false);
+  const [secs, setSecs] = useState(0);
+
+  useEffect(() => { setRes(null); setErr(""); }, [host.resetTick]);          // answers were cleared
+  useEffect(() => {
+    if (!busy) return undefined;
+    setSecs(0);
+    const t = setInterval(() => setSecs(v => v + 1), 1000);
+    return () => clearInterval(t);
+  }, [busy]);
+
+  const call = (path, body) => fetch(`${API_URL}${path}`, {
+    method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ code: host.code, token: host.token, kind, ...body }),
+  });
+
+  const generate = async (fresh = false) => {
+    setBusy(true); setErr("");
+    try {
+      const r = await call("/deck/generate", { fresh });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.error) throw new Error(d.error || `Server error ${r.status}`);
+      setRes(d);
+    } catch (e) { setErr(e.message || "Could not generate the presentation."); }
+    setBusy(false);
+  };
+
+  const download = async () => {
+    setDl(true); setErr("");
+    try {
+      const r = await call("/deck/file", {});
+      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
+      const blob = await r.blob();
+      const name = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || res?.fileName || "presentation.pptx";
+      const href = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = href; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => window.URL.revokeObjectURL(href), 4000);
+    } catch (e) { setErr(e.message || "Download failed."); }
+    setDl(false);
+  };
+
+  return { busy, res, err, dl, secs, generate, download };
 }
-function pHeadline(s, text, color = P.INK, w = 9) {
-  s.addText(String(text || ""), { x:0.5, y:0.62, w, h:0.78, fontSize:23, bold:true, color,
-    fontFace:F_HEAD, valign:"top", wrap:true, shrinkText:true, lineSpacingMultiple:1.05 });
+
+function QaList({ qa }) {
+  const icon = {
+    pass: <CheckCircleIcon sx={{ fontSize:18, color:"#1E8E5A", mt:"1px" }}/>,
+    warn: <WarningAmberIcon sx={{ fontSize:18, color:"#C77700", mt:"1px" }}/>,
+    info: <InfoOutlinedIcon sx={{ fontSize:18, color:MUTED, mt:"1px" }}/>,
+  };
+  return (
+    <Stack spacing={1.1}>
+      {qa.map((q, i) => (
+        <Box key={i} sx={{ display:"flex", gap:1.2, alignItems:"flex-start" }}>
+          {icon[q.status] || icon.info}
+          <Box sx={{ minWidth:0 }}>
+            <Typography sx={{ fontSize:"0.86rem", fontWeight:700, color:INK, lineHeight:1.45 }}>{q.label}</Typography>
+            {q.detail && <Typography sx={{ fontSize:"0.78rem", color:MUTED, lineHeight:1.6 }}>{q.detail}</Typography>}
+          </Box>
+        </Box>
+      ))}
+    </Stack>
+  );
 }
 
-async function buildDeckPptx(spec) {
-  const pptx = new pptxgen();
-  pptx.layout = "LAYOUT_16x9";              // 10 x 5.625 in
-  pptx.author = "Carnelian";
-  pptx.company = "Carnelian";
-  pptx.title = "What you told us";
+/** Shared result block: summary, file facts, checklist. */
+function DeckResult({ res }) {
+  if (!res) return null;
+  const warns = res.qa.filter(q => q.status === "warn").length;
+  return (
+    <Box sx={{ mt:2.8, display:"grid", gap:2.2, gridTemplateColumns:{ xs:"1fr", md: res.summary ? "1fr 1fr" : "1fr" } }}>
+      {res.summary && (
+        <Box sx={{ p:2.4, borderRadius:3, background:"#fff", border:`1px solid ${PINK}` }}>
+          <Box sx={{ display:"flex", alignItems:"center", gap:1, mb:1 }}>
+            <BoltIcon sx={{ fontSize:16, color:MAGENTA }} />
+            <SectionTag color={MAROON}>What Claude found · read before sharing</SectionTag>
+          </Box>
+          <Typography sx={{ whiteSpace:"pre-wrap", fontSize:"0.9rem", lineHeight:1.8, color:INK }}>{res.summary}</Typography>
+        </Box>
+      )}
+      <Box sx={{ p:2.4, borderRadius:3, background:"#fff", border:`1px solid ${LINE}` }}>
+        <Box sx={{ display:"flex", alignItems:"center", gap:1, mb:1.6, flexWrap:"wrap" }}>
+          <SectionTag color={MAROON}>Checks</SectionTag>
+          <Chip size="small" label={`${res.slides} slides`} sx={{ background:BLUSH, color:MAROON }} />
+          <Chip size="small" label={warns ? `${warns} to look at` : "All clear"}
+            sx={{ background: warns ? "#FFF1DC" : "#E3F5EB", color: warns ? "#8A5200" : "#1E6B45" }} />
+        </Box>
+        <QaList qa={res.qa} />
+      </Box>
+    </Box>
+  );
+}
 
-  const find = (t) => (spec.slides || []).find(s => s.type === t) || {};
-  const n  = spec.n || 0;
-  const nf = spec.functions || 0;
+function DeckButtons({ deck, label = "Generate", disabled }) {
+  const { busy, res, dl, generate, download } = deck;
+  return (
+    <Stack direction="row" spacing={1.2} sx={{ flexWrap:"wrap", gap:1.2 }}>
+      <Button variant={res ? "outlined" : "contained"} size="large" onClick={()=>generate(!!res)} disabled={busy || disabled}
+        startIcon={busy ? <CircularProgress size={16} sx={{ color: res ? MAROON : "#fff" }}/> : <AutoAwesomeIcon/>}>
+        {busy ? "Building…" : res ? "Regenerate" : label}
+      </Button>
+      {res && (
+        <Button variant="contained" size="large" onClick={download} disabled={dl || busy}
+          startIcon={dl ? <CircularProgress size={16} sx={{ color:"#fff" }}/> : <DownloadIcon/>}>
+          Download .pptx
+        </Button>
+      )}
+    </Stack>
+  );
+}
 
-  /* ── 1 · Title ─────────────────────────────────────────────────────────── */
-  const t = find("title");
-  const s1 = pptx.addSlide();
-  s1.background = { color: P.W };
-  s1.addShape(pptx.ShapeType.rect, { x:0, y:0, w:10, h:0.12, fill:{ color:P.M }, line:{ color:P.M } });
-  s1.addShape(pptx.ShapeType.rect, { x:6.9, y:0.12, w:3.1, h:5.505, fill:{ color:P.BLUSH }, line:{ color:P.BLUSH } });
-  pTag(s1);
-  s1.addText(t.title || "What you told us",
-    { x:0.5, y:1.75, w:6.3, h:1.2, fontSize:46, bold:true, color:P.INK, fontFace:F_HEAD, valign:"middle" });
-  s1.addText(t.subtitle || `${n} leaders, ${nf} functions, a few minutes ago`,
-    { x:0.5, y:3.0, w:6.3, h:0.5, fontSize:20, color:P.MAR, fontFace:F_BODY });
-  s1.addText(`n = ${n}`,
-    { x:0.5, y:3.62, w:3, h:0.35, fontSize:18, bold:true, color:P.M, fontFace:F_BODY });
-  s1.addText("foodpanda Pakistan  ·  RISE Alignment  ·  Confidential",
-    { x:0.5, y:4.95, w:6.3, h:0.3, fontSize:11, color:P.GREY, fontFace:F_BODY });
-
-  /* ── 2 · Where the room agrees (bars) ──────────────────────────────────── */
-  const b = find("bars");
-  const s2 = pptx.addSlide();
-  s2.background = { color: P.W };
-  pTag(s2); pHeadline(s2, b.headline, P.INK, 8.2);
-  s2.addText(`n = ${n}`, { x:8.5, y:0.28, w:1, h:0.3, fontSize:13, bold:true, color:P.M, fontFace:F_BODY, align:"right" });
-  const bars = (b.bars || []).slice(0, 6);
-  const maxV = Math.max(1, ...bars.map(x => Number(x.value) || 0));
-  const BX = 4.15, BW = 4.55, ROW = 0.53, TOP = 1.62;
-  bars.forEach((bar, i) => {
-    const y = TOP + i * ROW;
-    const v = Number(bar.value) || 0;
-    const on = !!bar.emphasis;
-    s2.addText(String(bar.label || ""), { x:0.5, y, w:3.5, h:0.4, fontSize:13,
-      bold:on, color: on ? P.INK : P.GREY, fontFace:F_BODY, valign:"middle", wrap:false, shrinkText:true });
-    s2.addShape(pptx.ShapeType.roundRect, { x:BX, y:y+0.09, w:BW, h:0.24, rectRadius:0.12,
-      fill:{ color:P.BLUSH }, line:{ color:P.BLUSH } });
-    if (v > 0) s2.addShape(pptx.ShapeType.roundRect, { x:BX, y:y+0.09, w:Math.max(0.24, BW * (v / maxV)), h:0.24,
-      rectRadius:0.12, fill:{ color: on ? P.M : P.PINK }, line:{ color: on ? P.M : P.PINK } });
-    s2.addText(String(v), { x:BX + BW + 0.12, y, w:0.6, h:0.4, fontSize:14, bold:true,
-      color: on ? P.M : P.GREY, fontFace:F_BODY, valign:"middle" });
-  });
-  if (b.note) s2.addText(b.note, { x:0.5, y:4.92, w:9, h:0.45, fontSize:18, color:P.MAR, fontFace:F_BODY, wrap:true, shrinkText:true });
-
-  /* ── 3 · Function by function (table) ──────────────────────────────────── */
-  const tb = find("table");
-  const s3 = pptx.addSlide();
-  s3.background = { color: P.W };
-  pTag(s3); pHeadline(s3, tb.headline);
-  const cols = tb.columns || ["Function","Top two behaviours","What good looks like"];
-  const body = (tb.rows || []).slice(0, 12);
-  const fs   = body.length <= 6 ? 14 : body.length <= 9 ? 12 : 11;   // fit 9–11 functions on one slide
-  const head = cols.map(c => ({ text:c, options:{ bold:true, color:P.W, fill:{ color:P.INK }, fontSize:fs, fontFace:F_HEAD } }));
-  const rows = body.map((r, i) => r.map((c, j) => ({
-    text: String(c ?? ""),
-    options:{ fontSize:fs, fontFace:F_BODY, color: j === 0 ? P.MAR : P.INK, bold: j === 0,
-      fill:{ color: i % 2 ? P.BLUSH : P.W } },
-  })));
-  s3.addTable([head, ...rows], {
-    x:0.5, y:1.55, w:9, colW:[2.0, 3.7, 3.3], border:{ type:"solid", color:"EDE2E7", pt:1 },
-    valign:"middle", rowH:0.34, margin:[4, 7, 4, 7], autoPage:false,
-  });
-
-  /* ── 4 · Where decisions get stuck (themes) ────────────────────────────── */
-  const th = find("themes");
-  const s4 = pptx.addSlide();
-  s4.background = { color: P.W };
-  pTag(s4); pHeadline(s4, th.headline);
-  const themes = (th.themes || []).slice(0, 3);
-  const TH = themes.length === 3 ? 1.12 : 1.55;
-  themes.forEach((x, i) => {
-    const y = 1.62 + i * (TH + 0.16);
-    s4.addShape(pptx.ShapeType.rect, { x:0.5, y, w:9, h:TH, fill:{ color:P.BLUSH }, line:{ color:P.BLUSH } });
-    s4.addShape(pptx.ShapeType.rect, { x:0.5, y, w:0.06, h:TH, fill:{ color:P.M }, line:{ color:P.M } });
-    s4.addText(String(x.title || ""), { x:0.78, y:y+0.13, w:6.4, h:0.34, fontSize:18, bold:true, color:P.INK, fontFace:F_HEAD });
-    s4.addText(String(x.line || ""),  { x:0.78, y:y+0.5,  w:6.4, h:TH-0.62, fontSize:18, color:P.MAR, fontFace:F_BODY, wrap:true, shrinkText:true, valign:"top" });
-    if (x.count) s4.addText(String(x.count), { x:7.35, y:y+0.13, w:2.05, h:0.42, fontSize:14, bold:true,
-      color:P.M, fontFace:F_BODY, align:"right", valign:"middle", wrap:true, shrinkText:true });
-  });
-
-  /* ── 5 · Unique to one function (outliers) ─────────────────────────────── */
-  const ou = find("outliers");
-  const s5 = pptx.addSlide();
-  s5.background = { color: P.W };
-  pTag(s5); pHeadline(s5, ou.headline || "A few needs sit outside the common pattern");
-  const items = (ou.items || []).slice(0, 3);
-  if (items.length) {
-    items.forEach((x, i) => {
-      const y = 1.72 + i * 1.02;
-      s5.addShape(pptx.ShapeType.roundRect, { x:0.5, y, w:2.15, h:0.44, rectRadius:0.08, fill:{ color:P.M }, line:{ color:P.M } });
-      s5.addText(String(x.function || ""), { x:0.5, y, w:2.15, h:0.44, fontSize:13, bold:true, color:P.W,
-        fontFace:F_HEAD, align:"center", valign:"middle", wrap:false, shrinkText:true });
-      s5.addText(String(x.need || ""), { x:2.85, y:y-0.05, w:6.65, h:0.75, fontSize:18, color:P.INK,
-        fontFace:F_BODY, valign:"middle", wrap:true, shrinkText:true });
-    });
-  } else {
-    s5.addText(ou.fallback || "No needs sat outside the common pattern.",
-      { x:0.5, y:1.9, w:9, h:0.6, fontSize:20, color:P.MAR, fontFace:F_BODY, wrap:true });
-  }
-
-  /* ── 6 · Discussion (dark) ─────────────────────────────────────────────── */
-  const ds = find("discussion");
-  const s6 = pptx.addSlide();
-  s6.background = { color: P.INK };
-  pTag(s6, "WHAT YOU TOLD US", P.PINK);
-  s6.addText(ds.headline || "How do we cater to these?",
-    { x:0.5, y:0.95, w:9, h:0.8, fontSize:34, bold:true, color:P.W, fontFace:F_HEAD });
-  const qs = (ds.questions && ds.questions.length ? ds.questions : [
-    "Is this a need for one function, or an early signal for all of us?",
-    "Where does it sit: something people learn, something managers do, or something the organisation changes?",
-  ]).slice(0, 2);
-  qs.forEach((q, i) => {
-    const y = 2.25 + i * 1.35;
-    s6.addText(String(i + 1), { x:0.5, y, w:0.55, h:0.55, fontSize:26, bold:true, color:P.M, fontFace:F_HEAD, valign:"middle" });
-    s6.addText(String(q), { x:1.15, y:y-0.08, w:8.3, h:1.05, fontSize:22, color:P.W, fontFace:F_BODY,
-      valign:"middle", wrap:true, shrinkText:true, lineSpacingMultiple:1.15 });
-  });
-
-  /* ── 7 · What your teams are waiting to hear ───────────────────────────── */
-  const ms = find("messages");
-  const s7 = pptx.addSlide();
-  s7.background = { color: P.W };
-  pTag(s7); pHeadline(s7, ms.headline);
-  const msgs = (ms.messages || []).slice(0, 5);
-  const MH = msgs.length <= 3 ? 0.82 : msgs.length === 4 ? 0.68 : 0.56;
-  msgs.forEach((m, i) => {
-    const y = 1.6 + i * (MH + 0.12);
-    s7.addShape(pptx.ShapeType.rect, { x:0.5, y, w:9, h:MH, fill:{ color: i % 2 ? P.W : P.BLUSH }, line:{ color:"EDE2E7" } });
-    s7.addShape(pptx.ShapeType.ellipse, { x:0.74, y:y + MH/2 - 0.07, w:0.14, h:0.14, fill:{ color:P.M }, line:{ color:P.M } });
-    s7.addText(String(m), { x:1.08, y, w:8.2, h:MH, fontSize:18, color:P.INK, fontFace:F_BODY,
-      valign:"middle", wrap:true, shrinkText:true });
-  });
-  s7.addText(ms.footer || "We'll build on these next.",
-    { x:0.5, y:5.02, w:9, h:0.35, fontSize:14, italic:true, color:P.MAR, fontFace:F_BODY });
-
-  const stamp = new Date().toISOString().slice(0, 10);
-  await pptx.writeFile({ fileName: `What-you-told-us_${stamp}.pptx` });
+function DeckProgress({ deck }) {
+  if (!deck.busy) return null;
+  return (
+    <Box sx={{ mt:2.5 }}>
+      <LinearProgress />
+      <Typography sx={{ fontSize:"0.78rem", color:MUTED, mt:1 }}>
+        Reading every answer and building the slides · {deck.secs}s · usually under a minute
+      </Typography>
+    </Box>
+  );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1005,6 +981,8 @@ function Dashboard({ onExit }) {
   const [boot, setBoot]   = useState(true);
   const [qr, setQr]       = useState(false);
   const [fatal, setFatal] = useState("");
+  const [panel, setPanel] = useState("results");     // "results" | "deck"
+  const [resetTick, setResetTick] = useState(0);
 
   const socket = useSocket({
     "session:state":    (s) => { setState(s); setBoot(false); },
@@ -1022,6 +1000,7 @@ function Dashboard({ onExit }) {
       const c = localStorage.getItem("fp_host"), t = localStorage.getItem("fp_host_token");
       if (c && t) getSocket().emit("host:resume", { code:c, token:t });
     },
+    "session:reset": () => setResetTick(v => v + 1),
   });
 
   // resume if we already hold the room, otherwise create it straight away
@@ -1040,7 +1019,7 @@ function Dashboard({ onExit }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const openActivity  = (id) => socket.emit("activity:open",  { code, token, activityId:id });
+  const openActivity  = (id) => { setPanel("results"); socket.emit("activity:open",  { code, token, activityId:id }); };
   const closeActivity = ()   => socket.emit("activity:close", { code, token });
   const setRound      = (r)  => socket.emit("activity:round", { code, token, round:r });
   const endSession    = ()   => { if (window.confirm("End the session for everyone? The room code stops working.")) socket.emit("session:end", { code, token }); };
@@ -1068,9 +1047,12 @@ function Dashboard({ onExit }) {
   }
 
   const joinLink = `${JOIN_URL}/?s=${state.code}`;
+  const answered = ACTIVITIES.filter(a => (data[a.id]?.count || 0) > 0).length;
+  const deckReady = answered === ACTIVITIES.length && !state.liveActivity;
   if (qr) return <QrPresent code={state.code} link={joinLink} count={state.participants?.length || 0} onClose={()=>setQr(false)} />;
 
   return (
+    <HostCtx.Provider value={{ code, token, resetTick }}>
     <Box sx={{ minHeight:"100vh", background:CANVAS }}>
       <BrandBar dark right={
         <Stack direction="row" spacing={1.2} alignItems="center">
@@ -1079,6 +1061,15 @@ function Dashboard({ onExit }) {
             label={`${state.participants?.length || 0} in the room`}
             sx={{ background:"rgba(255,255,255,0.08)", color:"#fff", fontWeight:700 }} />
           <Button size="small" variant="contained" startIcon={<QrCode2Icon/>} onClick={()=>setQr(true)}>Show QR</Button>
+          <Tooltip describeChild title={deckReady ? "All seven activities are done" : `${answered} of 7 activities have answers`}>
+            <Button size="small" startIcon={<SlideshowIcon/>} onClick={()=>setPanel(panel === "deck" ? "results" : "deck")}
+              variant={deckReady || panel === "deck" ? "contained" : "outlined"}
+              sx={deckReady || panel === "deck"
+                ? { background:"#fff", color:INK, "&:hover":{ background:BLUSH } }
+                : { color:"#fff", borderColor:"rgba(255,255,255,0.3)", "&:hover":{ borderColor:"#fff", background:"rgba(255,255,255,0.08)" } }}>
+              Presentation
+            </Button>
+          </Tooltip>
           <Box sx={{ width:"1px", height:22, background:"rgba(255,255,255,0.15)", mx:0.5 }} />
           {/* Destructive. Labelled in words so neither can be mistaken for a refresh. */}
           <Button size="small" startIcon={<RestartAltIcon sx={{ fontSize:"16px !important" }}/>} onClick={resetSession}
@@ -1140,9 +1131,73 @@ function Dashboard({ onExit }) {
           </Stack>
         </Paper>
 
-        <Box sx={{ minWidth:0 }}><Results state={state} data={data} /></Box>
+        <Box sx={{ minWidth:0 }}>
+          {panel === "deck"
+            ? <PresentationPanel state={state} data={data} onBack={()=>setPanel("results")} />
+            : <Results state={state} data={data} />}
+        </Box>
       </Box>
     </Box>
+    </HostCtx.Provider>
+  );
+}
+
+/** Final deck: every activity, built from the live answers. */
+function PresentationPanel({ state, data, onBack }) {
+  const deck = useDeck("session");
+  const rows = ACTIVITIES.map(a => ({ ...a, n: data[a.id]?.count || 0 }));
+  const answered = rows.filter(r => r.n > 0).length;
+  const live = state.liveActivity ? byId(state.liveActivity) : null;
+
+  return (
+    <Stack spacing={2.5}>
+      <Paper elevation={1} sx={{ p:3, border:`1px solid ${LINE}`, background:`linear-gradient(100deg, ${BLUSH}, #fff 62%)` }}>
+        <Button size="small" startIcon={<ArrowBackIcon/>} onClick={onBack} sx={{ color:MUTED, ml:-1, mb:1.2 }}>Live results</Button>
+        <Box sx={{ display:"flex", alignItems:"flex-start", gap:2.5, flexWrap:"wrap" }}>
+          <Box sx={{ flex:1, minWidth:260 }}>
+            <SectionTag>Session presentation</SectionTag>
+            <Typography variant="h5" sx={{ mt:0.6, mb:0.8 }}>Generate the presentation</Typography>
+            <Typography sx={{ color:MUTED, fontSize:"0.9rem", lineHeight:1.75, maxWidth:560 }}>
+              One deck from every activity, in RISE Alignment branding. Every number comes straight from the answers;
+              Claude writes the headlines. Activity 4 follows its seven-slide spec and reuses the wording from the break.
+            </Typography>
+          </Box>
+          <DeckButtons deck={deck} label="Generate presentation" disabled={answered === 0} />
+        </Box>
+
+        {live && (
+          <Box sx={{ mt:2.2, p:1.6, borderRadius:2.5, background:"#FFF1DC", display:"flex", gap:1.2, alignItems:"center" }}>
+            <WarningAmberIcon sx={{ fontSize:18, color:"#C77700" }} />
+            <Typography sx={{ fontSize:"0.85rem", color:"#6B4200", fontWeight:600 }}>
+              Activity {live.id} is still open. Close it first so late answers make it into the deck.
+            </Typography>
+          </Box>
+        )}
+        <DeckProgress deck={deck} />
+        {deck.err && <Typography sx={{ color:FLAME, fontSize:"0.85rem", mt:2, fontWeight:600 }}>{deck.err}</Typography>}
+        <DeckResult res={deck.res} />
+      </Paper>
+
+      <Paper elevation={1} sx={{ p:3, border:`1px solid ${LINE}` }}>
+        <Box sx={{ display:"flex", alignItems:"center", gap:1.2, mb:2 }}>
+          <SectionTag>What goes in</SectionTag>
+          <Chip size="small" label={`${answered} of ${ACTIVITIES.length} with answers`}
+            sx={{ background: answered === ACTIVITIES.length ? "#E3F5EB" : BLUSH, color: answered === ACTIVITIES.length ? "#1E6B45" : MAROON }} />
+        </Box>
+        <Stack spacing={0.8}>
+          {rows.map(r => (
+            <Box key={r.id} sx={{ display:"flex", alignItems:"center", gap:1.5, py:0.9, borderBottom:`1px solid ${LINE}` }}>
+              <Box sx={{ width:26, height:26, borderRadius:"8px", display:"grid", placeItems:"center", flexShrink:0,
+                background: r.n ? PINK : "#F0E9EC", color: r.n ? MAROON : MUTED, fontWeight:800, fontSize:"0.8rem" }}>{r.id}</Box>
+              <Typography sx={{ flex:1, fontSize:"0.9rem", fontWeight:600, color: r.n ? INK : MUTED }}>{r.name}</Typography>
+              <Typography sx={{ fontSize:"0.8rem", color:MUTED, fontVariantNumeric:"tabular-nums" }}>{r.n} {r.n === 1 ? "answer" : "answers"}</Typography>
+              <Chip size="small" label={r.n ? "In" : "Left out"}
+                sx={{ minWidth:64, background: r.n ? "#E3F5EB" : "#F0E9EC", color: r.n ? "#1E6B45" : MUTED }} />
+            </Box>
+          ))}
+        </Stack>
+      </Paper>
+    </Stack>
   );
 }
 
@@ -1339,10 +1394,7 @@ function ResultBody({ activity, data, liveRound }) {
 }
 
 function DeckPanel({ rows, count }) {
-  const [busy, setBusy]   = useState(false);
-  const [spec, setSpec]   = useState(null);
-  const [err, setErr]     = useState("");
-  const [dl, setDl]       = useState(false);
+  const deck = useDeck("a4");
 
   const byFunction = useMemo(() => {
     const m = {};
@@ -1355,27 +1407,6 @@ function DeckPanel({ rows, count }) {
     rows.forEach(r => (r.answers?.behaviours || []).forEach(b => { t[b] = (t[b] || 0) + 1; }));
     return t;
   }, [rows]);
-
-  const generate = async () => {
-    setBusy(true); setErr(""); setSpec(null);
-    try {
-      const res = await fetch(`${API_URL}/ai/deck`, {
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ responses: rows }),
-      });
-      const d = await res.json();
-      if (d.error) throw new Error(d.error);
-      setSpec(d);
-    } catch (e) { setErr(e.message || "Generation failed."); }
-    setBusy(false);
-  };
-
-  const download = async () => {
-    setDl(true);
-    try { await buildDeckPptx(spec); }
-    catch (e) { setErr("Could not build the file: " + e.message); }
-    setDl(false);
-  };
 
   const maxB = Math.max(1, ...Object.values(behaviourTally));
 
@@ -1390,35 +1421,11 @@ function DeckPanel({ rows, count }) {
               Seven slides from these answers, in session branding. Run this at the break.
             </Typography>
           </Box>
-          <Stack direction="row" spacing={1.2}>
-            <Button variant={spec ? "outlined" : "contained"} size="large" onClick={generate} disabled={busy || count === 0}
-              startIcon={busy ? <CircularProgress size={16} sx={{ color: spec ? MAROON : "#fff" }}/> : <AutoAwesomeIcon/>}>
-              {busy ? "Analysing…" : spec ? "Regenerate" : "Generate deck"}
-            </Button>
-            {spec && (
-              <Button variant="contained" size="large" onClick={download} disabled={dl}
-                startIcon={dl ? <CircularProgress size={16} sx={{ color:"#fff" }}/> : <DownloadIcon/>}>
-                Download .pptx
-              </Button>
-            )}
-          </Stack>
+          <DeckButtons deck={deck} label="Generate deck" disabled={count === 0} />
         </Box>
-        {busy && <LinearProgress sx={{ mt:2.5 }} />}
-        {err && <Typography sx={{ color:FLAME, fontSize:"0.85rem", mt:2, fontWeight:600 }}>{err}</Typography>}
-        {spec?.summary && (
-          <Box sx={{ mt:2.8, p:2.4, borderRadius:3, background:"#fff", border:`1px solid ${PINK}` }}>
-            <Box sx={{ display:"flex", alignItems:"center", gap:1, mb:1 }}>
-              <BoltIcon sx={{ fontSize:16, color:MAGENTA }} />
-              <SectionTag color={MAROON}>Sanity check before you send it</SectionTag>
-            </Box>
-            <Typography sx={{ whiteSpace:"pre-wrap", fontSize:"0.92rem", lineHeight:1.8, color:INK }}>{spec.summary}</Typography>
-            <Divider sx={{ my:2 }} />
-            <Typography sx={{ fontSize:"0.78rem", color:MUTED, lineHeight:1.7 }}>
-              Check: n on slide 1 matches {count}. Bar totals equal {count * 2}. No names anywhere. The acquiring company is not named.
-              Slides 4 and 7 carry no function labels.
-            </Typography>
-          </Box>
-        )}
+        <DeckProgress deck={deck} />
+        {deck.err && <Typography sx={{ color:FLAME, fontSize:"0.85rem", mt:2, fontWeight:600 }}>{deck.err}</Typography>}
+        <DeckResult res={deck.res} />
       </Paper>
 
       <Box sx={{ display:"grid", gap:2.5, gridTemplateColumns:{ xs:"1fr", md:"1fr 1fr" } }}>
