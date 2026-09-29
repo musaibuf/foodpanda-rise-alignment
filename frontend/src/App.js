@@ -709,17 +709,38 @@ function Landing({ go }) {
 /* ─────────────────────────────────────────────────────────────────────────────
    8 · PARTICIPANT
 ───────────────────────────────────────────────────────────────────────────── */
+/** Forget this phone's seat in a room (keeps the name, so rejoining is one tap). */
+const clearSeat = () => ["fp_pid","fp_code","fp_done"].forEach(k => localStorage.removeItem(k));
+
+/**
+ * What this phone should start with. A freshly scanned QR for a different room always
+ * wins over whatever was saved from an earlier session.
+ */
+function bootSeat(scanned) {
+  const saved = localStorage.getItem("fp_code");
+  if (scanned && saved && saved !== scanned) clearSeat();
+  return { code: scanned || localStorage.getItem("fp_code") || "", pid: localStorage.getItem("fp_pid") || "" };
+}
+
 function Participant({ initialCode, onExit }) {
-  const [code, setCode]     = useState(localStorage.getItem("fp_code") || initialCode || "");
+  const [boot]              = useState(() => bootSeat(initialCode));      // runs before anything reads storage
+  const [code, setCode]     = useState(boot.code);
   const [name, setName]     = useState(localStorage.getItem("fp_name") || "");
-  const [pid, setPid]       = useState(localStorage.getItem("fp_pid")  || "");
-  const [joined, setJoined] = useState(!!localStorage.getItem("fp_pid"));
+  const [pid, setPid]       = useState(boot.pid);
+  const [joined, setJoined] = useState(!!boot.pid);
   const [state, setState]   = useState(null);
   const [done, setDone]     = useState(() => JSON.parse(localStorage.getItem("fp_done") || "[]"));
   const [busy, setBusy]     = useState(false);
   const [err,  setErr]      = useState("");
+  const [slow, setSlow]     = useState(false);
 
-  const clearLocal = () => ["fp_pid","fp_code","fp_name","fp_done"].forEach(k => localStorage.removeItem(k));
+  const clearLocal = clearSeat;
+
+  /** Drop back to the join screen, keeping the name and (if scanned) the new code. */
+  const backToJoin = (message) => {
+    clearSeat(); setPid(""); setJoined(false); setState(null); setBusy(false);
+    setCode(initialCode || ""); setErr(message || "");
+  };
 
   const socket = useSocket({
     "session:state": (s) => setState(s),
@@ -730,8 +751,12 @@ function Participant({ initialCode, onExit }) {
       if (submitted) { localStorage.setItem("fp_done", JSON.stringify(submitted)); setDone(submitted); }
       setPid(participantId); setState(session); setJoined(true); setBusy(false); setErr("");
     },
-    "join:error": (m) => { setErr(m || "Could not join. Check the room code."); setBusy(false); },
-    "session:ended": () => { clearLocal(); setJoined(false); setState(null); },
+    "join:error": (m) => {
+      // an automatic rejoin failed: the room this phone remembered is gone
+      if (joined) backToJoin("That session has ended. Enter the room code on the screen to join the current one.");
+      else { setErr(m || "Could not join. Check the room code."); setBusy(false); }
+    },
+    "session:ended": () => backToJoin("The facilitator ended that session. Scan the new code to join again."),
     "session:reset": () => { localStorage.setItem("fp_done", "[]"); setDone([]); },
     "connect": () => {
       const c = localStorage.getItem("fp_code"), p = localStorage.getItem("fp_pid");
@@ -743,6 +768,12 @@ function Participant({ initialCode, onExit }) {
     if (joined && pid && code) socket.emit("participant:join", { code, name, participantId: pid });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!joined || state) { setSlow(false); return undefined; }
+    const t = setTimeout(() => setSlow(true), 8000);
+    return () => clearTimeout(t);
+  }, [joined, state]);
 
   const join = () => {
     if (!code.trim() || !name.trim()) return;
@@ -786,7 +817,24 @@ function Participant({ initialCode, onExit }) {
     );
   }
 
-  if (!state) return <Box sx={{ minHeight:"100vh", display:"grid", placeItems:"center", background:CANVAS }}><CircularProgress sx={{ color:MAGENTA }} /></Box>;
+  if (!state) {
+    return (
+      <Box sx={{ minHeight:"100vh", display:"grid", placeItems:"center", background:CANVAS, px:3 }}>
+        <Box sx={{ textAlign:"center", maxWidth:340 }}>
+          <CircularProgress sx={{ color:MAGENTA }} />
+          <Typography sx={{ mt:2.5, fontWeight:700, color:INK }}>Connecting to the session…</Typography>
+          {slow && (
+            <>
+              <Typography sx={{ mt:1, color:MUTED, fontSize:"0.9rem", lineHeight:1.7 }}>
+                This is taking longer than usual. If the facilitator started a new session, join it again.
+              </Typography>
+              <Button variant="contained" sx={{ mt:2.5 }} onClick={()=>backToJoin("")}>Join again</Button>
+            </>
+          )}
+        </Box>
+      </Box>
+    );
+  }
 
   const live      = state.liveActivity;
   const activity  = live ? byId(live) : null;
@@ -1072,7 +1120,7 @@ function Dashboard({ onExit }) {
           <Box sx={{ width:64, height:64, borderRadius:"50%", background:BLUSH, display:"grid", placeItems:"center", mx:"auto", mb:3 }}>
             <LockIcon sx={{ color:MAROON, fontSize:30 }} />
           </Box>
-          <Typography variant="h5" sx={{ mb:1.5 }}>Room is taken</Typography>
+          <Typography variant="h5" sx={{ mb:1.5 }}>{/ended/i.test(fatal) ? "That session has ended" : "Room is taken"}</Typography>
           <Typography sx={{ color:MUTED, lineHeight:1.8, mb:4 }}>{fatal}</Typography>
           <Button variant="contained" onClick={onExit} startIcon={<ArrowBackIcon/>}>Back to home</Button>
         </Box>
