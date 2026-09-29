@@ -36,6 +36,7 @@ import BoltIcon             from "@mui/icons-material/Bolt";
 import SlideshowIcon        from "@mui/icons-material/Slideshow";
 import WarningAmberIcon     from "@mui/icons-material/WarningAmber";
 import InfoOutlinedIcon     from "@mui/icons-material/InfoOutlined";
+import TableViewIcon        from "@mui/icons-material/TableView";
 
 /* ─────────────────────────────────────────────────────────────────────────────
    1 · BRAND TOKENS
@@ -423,6 +424,20 @@ function Donut({ data, size = 190 }) {
 ───────────────────────────────────────────────────────────────────────────── */
 const HostCtx = createContext({ code:"", token:"", resetTick:0 });
 
+/** POSTs to the server and saves the file it returns, keeping the server's filename. */
+async function downloadFile(path, body, fallbackName) {
+  const r = await fetch(`${API_URL}${path}`, {
+    method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
+  const blob = await r.blob();
+  const name = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || fallbackName;
+  const href = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => window.URL.revokeObjectURL(href), 4000);
+}
+
 function useDeck(kind) {
   const host = useContext(HostCtx);
   const [busy, setBusy] = useState(false);
@@ -458,19 +473,38 @@ function useDeck(kind) {
   const download = async () => {
     setDl(true); setErr("");
     try {
-      const r = await call("/deck/file", {});
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || `Server error ${r.status}`); }
-      const blob = await r.blob();
-      const name = (r.headers.get("Content-Disposition") || "").match(/filename="([^"]+)"/)?.[1] || res?.fileName || "presentation.pptx";
-      const href = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = href; a.download = name; document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => window.URL.revokeObjectURL(href), 4000);
+      await downloadFile("/deck/file", { code: host.code, token: host.token, kind }, res?.fileName || "presentation.pptx");
     } catch (e) { setErr(e.message || "Download failed."); }
     setDl(false);
   };
 
   return { busy, res, err, dl, secs, generate, download };
+}
+
+/** Every answer from every activity as a formatted Excel workbook. */
+function DataButton({ total }) {
+  const host = useContext(HostCtx);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState("");
+  const go = async () => {
+    setBusy(true); setErr("");
+    try { await downloadFile("/export/xlsx", { code: host.code, token: host.token }, "RISE-Alignment_responses.xlsx"); }
+    catch (e) { setErr(e.message || "Download failed."); }
+    setBusy(false);
+  };
+  return (
+    <Box sx={{ mt:2.2, pt:2.2, borderTop:`1px solid ${LINE}` }}>
+      <Button fullWidth variant="outlined" onClick={go} disabled={busy || total === 0}
+        startIcon={busy ? <CircularProgress size={14} sx={{ color:MAROON }}/> : <TableViewIcon/>}
+        sx={{ py:1.1, borderColor:PINK, color:MAROON, fontWeight:800, "&:hover":{ borderColor:MAGENTA, background:BLUSH } }}>
+        {busy ? "Preparing…" : "Download data (.xlsx)"}
+      </Button>
+      <Typography sx={{ fontSize:"0.7rem", color:MUTED, mt:0.9, lineHeight:1.55, textAlign:"center" }}>
+        {err ? <Box component="span" sx={{ color:FLAME, fontWeight:600 }}>{err}</Box>
+             : "Every answer, one sheet per activity. Names only on My One Change."}
+      </Typography>
+    </Box>
+  );
 }
 
 function QaList({ qa }) {
@@ -1067,7 +1101,7 @@ function Dashboard({ onExit }) {
               sx={deckReady || panel === "deck"
                 ? { background:"#fff", color:INK, "&:hover":{ background:BLUSH } }
                 : { color:"#fff", borderColor:"rgba(255,255,255,0.3)", "&:hover":{ borderColor:"#fff", background:"rgba(255,255,255,0.08)" } }}>
-              Presentation
+              Make presentation
             </Button>
           </Tooltip>
           <Box sx={{ width:"1px", height:22, background:"rgba(255,255,255,0.15)", mx:0.5 }} />
@@ -1088,7 +1122,8 @@ function Dashboard({ onExit }) {
       <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"330px 1fr" }, alignItems:"start",
         maxWidth:1480, mx:"auto", px:{ xs:2, md:3 }, py:3, gap:3 }}>
 
-        <Paper elevation={1} sx={{ p:2.2, border:`1px solid ${LINE}`, position:{ lg:"sticky" }, top:16 }}>
+        <Paper elevation={1} sx={{ p:2.2, border:`1px solid ${LINE}`, position:{ lg:"sticky" }, top:16,
+          maxHeight:{ lg:"calc(100vh - 32px)" }, overflowY:{ lg:"auto" } }}>
           <SectionTag>Room code</SectionTag>
           <Typography sx={{ fontWeight:800, fontSize:"2.4rem", letterSpacing:"0.24em", color:INK, lineHeight:1.1, mb:2.4 }}>
             {state.code}
@@ -1129,6 +1164,7 @@ function Dashboard({ onExit }) {
               );
             })}
           </Stack>
+          <DataButton total={ACTIVITIES.reduce((n, a) => n + (data[a.id]?.count || 0), 0)} />
         </Paper>
 
         <Box sx={{ minWidth:0 }}>

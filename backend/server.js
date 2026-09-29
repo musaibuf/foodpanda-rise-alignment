@@ -14,6 +14,7 @@ const cors    = require("cors");
 const { Server } = require("socket.io");
 const Anthropic  = require("@anthropic-ai/sdk");
 const deck       = require("./deck");
+const ExcelJS    = require("exceljs");
 
 const PORT          = process.env.PORT || 5000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -417,6 +418,177 @@ app.get("/api/sessions/:code/export/:activityId", (req, res) => {
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="activity-${id}-${s.code}.csv"`);
   res.send([header.join(","), ...rows].join("\n"));
+});
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   5a · EXCEL EXPORT  (every answer, one sheet per activity)
+   Anonymity matches what leaders were told on their phones: names appear only
+   on My One Change. Anonymous sheets carry no timestamps, and each sheet is
+   shuffled differently so rows cannot be lined up across activities.
+───────────────────────────────────────────────────────────────────────────── */
+const XL = { M: "FFD7136B", MAR: "FF7A1538", INK: "FF1C1A22", BLUSH: "FFFBE4EC", W: "FFFFFFFF" };
+const saltHash = (pid, salt) => hashKey(`${salt}:${pid}`);
+
+async function buildWorkbook(s) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Carnelian";
+  wb.created = new Date();
+  const when = (ms) => (ms ? new Date(ms).toLocaleString("en-GB", { timeZone: "Asia/Karachi", day: "numeric",
+    month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "");
+  const rowsOf = (id) => Object.entries(s.responses[id] || {}).map(([pid, r]) => ({ pid, ...r }));
+  const anon = (id) => rowsOf(id).sort((a, b) => saltHash(a.pid, id) - saltHash(b.pid, id));
+
+  const sheet = (name, columns, { freeze = true } = {}) => {
+    const ws = wb.addWorksheet(name, { views: freeze ? [{ state: "frozen", ySplit: 1 }] : [] });
+    ws.columns = columns.map(c => ({ header: c.h, key: c.k, width: c.w }));
+    const hr = ws.getRow(1);
+    hr.font = { bold: true, color: { argb: XL.W }, name: "Calibri", size: 11 };
+    hr.fill = { type: "pattern", pattern: "solid", fgColor: { argb: XL.M } };
+    hr.alignment = { vertical: "middle", wrapText: true };
+    hr.height = 24;
+    return ws;
+  };
+  const finish = (ws) => {
+    ws.eachRow((row, i) => {
+      if (i === 1) return;
+      row.alignment = { vertical: "top", wrapText: true };
+      if (i % 2 === 1) row.eachCell({ includeEmpty: true }, c => { c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: XL.BLUSH } }; });
+    });
+    if (ws.rowCount > 1) ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: ws.columnCount } };
+  };
+  const bLabel = (k) => BEHAVIOUR_LABELS[k] || k || "";
+  const cLabel = (k) => COMMITMENT_LABELS[k] || k || "";
+
+  /* Session */
+  const info = sheet("Session", [{ h: "Item", k: "a", w: 34 }, { h: "Value", k: "b", w: 46 }, { h: "", k: "c", w: 16 }], { freeze: false });
+  info.addRows([
+    { a: "Room code", b: s.code },
+    { a: "Session", b: s.sessionName },
+    { a: "Started", b: when(s.startedAt) },
+    { a: "Exported", b: when(Date.now()) },
+    { a: "Leaders joined", b: s.participants.length },
+    {},
+  ]);
+  const hdr = info.addRow({ a: "Activity", b: "Shown with names", c: "Responses" });
+  hdr.font = { bold: true, color: { argb: XL.MAR } };
+  const NAMES = { 1: "1 · Headline 2027", 2: "2 · Predict the Number", 3: "3 · Whose Floor?", 4: "4 · What your function needs next",
+    5: "5 · Reality Check", 6: "6 · Question Bank", 7: "7 · My One Change" };
+  for (const id of Object.keys(SCHEMA).map(Number)) {
+    info.addRow({ a: NAMES[id], b: SCHEMA[id].anonymous ? (id === 4 ? "No, by function only" : "No, anonymous") : "Yes", c: rowsOf(id).length });
+  }
+  info.getColumn("b").alignment = { horizontal: "left" };
+  info.getColumn("c").alignment = { horizontal: "right" };
+
+  /* Participation: who joined and which activities they answered (never what they said) */
+  const part = sheet("Participation", [
+    { h: "Name", k: "name", w: 22 }, { h: "Joined", k: "joined", w: 20 },
+    ...[1, 2, 3, 4, 5, 6, 7].map(id => ({ h: `A${id}`, k: `a${id}`, w: 7 })),
+  ]);
+  [...s.participants].sort((a, b) => a.name.localeCompare(b.name)).forEach(p => {
+    const row = { name: p.name, joined: when(p.joinedAt) };
+    for (let id = 1; id <= 7; id++) {
+      const r = s.responses[id]?.[p.id];
+      row[`a${id}`] = r ? "✓" : "";      // a tick only: partial counts could single out a row
+    }
+    part.addRow(row);
+  });
+  for (let id = 1; id <= 7; id++) part.getColumn(`a${id}`).alignment = { horizontal: "center" };
+  finish(part);
+
+  /* 1 */
+  const s1 = sheet("1 Headline 2027", [{ h: "#", k: "n", w: 5 }, { h: "Headline for September 2027", k: "t", w: 90 }]);
+  anon(1).forEach((r, i) => s1.addRow({ n: i + 1, t: r.answers?.headline || "" }));
+  finish(s1);
+
+  /* 2 */
+  const s2 = sheet("2 Predict the Number", [
+    { h: "#", k: "n", w: 5 },
+    { h: "High-potentials regularly working beyond normal hours (real: 58.6%)", k: "q1", w: 42 },
+    { h: "Say the efficiency agenda is rarely explained well (real: 44.8%)", k: "q2", w: 42 },
+  ]);
+  anon(2).forEach((r, i) => s2.addRow({ n: i + 1, q1: r.answers?.q1 || "", q2: r.answers?.q2 || "" }));
+  finish(s2);
+
+  /* 3 */
+  const s3 = sheet("3 Whose Floor", [{ h: "#", k: "n", w: 5 }, ...[1, 2, 3, 4, 5].map(r => ({ h: `Round ${r}`, k: `r${r}`, w: 16 }))]);
+  anon(3).forEach((r, i) => s3.addRow({ n: i + 1, ...Object.fromEntries([1, 2, 3, 4, 5].map(k => [`r${k}`, r.answers?.[`r${k}`] || ""])) }));
+  finish(s3);
+
+  /* 4: by function, never by name */
+  const fnOrder = (f) => { const i = deck.FUNCTIONS.indexOf(f); return i < 0 ? 99 : i; };
+  const s4 = sheet("4 Function needs next", [
+    { h: "Function", k: "fn", w: 24 }, { h: "Behaviour 1", k: "b1", w: 28 }, { h: "Behaviour 2", k: "b2", w: 28 },
+    { h: "Missing behaviour or skill", k: "missing", w: 32 }, { h: "What good looks like", k: "good", w: 48 },
+    { h: "Where priorities clashed or a decision got stuck", k: "stuck", w: 60 },
+    { h: "Message the team needs to hear", k: "message", w: 44 },
+  ]);
+  anon(4).sort((a, b) => fnOrder(a.answers?.fn) - fnOrder(b.answers?.fn)).forEach(r => {
+    const a = r.answers || {}, b = a.behaviours || [];
+    s4.addRow({ fn: a.fn || "", b1: bLabel(b[0]), b2: bLabel(b[1]), missing: a.missing || "", good: a.good || "",
+      stuck: a.stuck || "", message: a.message || "" });
+  });
+  finish(s4);
+
+  /* 5 */
+  const s5 = sheet("5 Reality Check", [{ h: "#", k: "n", w: 5 }, ...[1, 2, 3].map(i => ({ h: `Commitment ${i}`, k: `c${i}`, w: 44 }))]);
+  anon(5).forEach((r, i) => { const c = r.answers?.commitments || []; s5.addRow({ n: i + 1, c1: cLabel(c[0]), c2: cLabel(c[1]), c3: cLabel(c[2]) }); });
+  finish(s5);
+
+  /* 6 */
+  const s6 = sheet("6 Question Bank", [{ h: "#", k: "n", w: 5 }, { h: "Hardest question the team is likely to ask", k: "q", w: 90 }]);
+  anon(6).forEach((r, i) => s6.addRow({ n: i + 1, q: r.answers?.q1 || "" }));
+  finish(s6);
+
+  /* 7: shown with names, as leaders were told */
+  const s7 = sheet("7 My One Change", [{ h: "Name", k: "name", w: 20 }, { h: "One change the team will notice in 30 days", k: "t", w: 90 }]);
+  rowsOf(7).sort((a, b) => String(a.name).localeCompare(String(b.name))).forEach(r => s7.addRow({ name: r.name || "", t: r.answers?.q1 || "" }));
+  finish(s7);
+
+  /* Totals */
+  const agg = aggregate(s);
+  const tot = sheet("Totals", [{ h: "Measure", k: "a", w: 52 }, { h: "", k: "b", w: 14 }, { h: "", k: "c", w: 14 }, { h: "", k: "d", w: 14 }, { h: "", k: "e", w: 14 }], { freeze: false });
+  tot.getRow(1).values = ["Totals, counted from every answer"];
+  const section = (title, head) => {
+    tot.addRow({});
+    const t = tot.addRow({ a: title }); t.font = { bold: true, size: 12, color: { argb: XL.MAR } };
+    const h = tot.addRow(head); h.font = { bold: true }; h.eachCell(c => { c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: XL.BLUSH } }; });
+  };
+  section("Predict the Number · guesses per band", { a: "Band", b: "Q1", c: "Q2" });
+  deck.BANDS.forEach(b => tot.addRow({ a: b, b: agg[2].tally.q1?.[b] || 0, c: agg[2].tally.q2?.[b] || 0 }));
+  tot.addRow({ a: "Real answer", b: "58.6%", c: "44.8%" }).font = { italic: true };
+  section("Whose Floor? · votes per round", { a: "Round", b: "Senior leader", c: "MD-2", d: "IC3", e: "Total" });
+  [1, 2, 3, 4, 5].forEach(r => {
+    const t = agg[3].tally[`r${r}`] || {};
+    const v = deck.VOICES.map(x => t[x] || 0);
+    tot.addRow({ a: `Round ${r}`, b: v[0], c: v[1], d: v[2], e: v[0] + v[1] + v[2] });
+  });
+  section("What your function needs next · leaders picking each behaviour", { a: "Behaviour", b: "Leaders" });
+  deck.BEHAVIOURS.map(b => ({ l: b.label, v: agg[4].tally.behaviours?.[b.key] || 0 })).sort((x, y) => y.v - x.v)
+    .forEach(x => tot.addRow({ a: x.l, b: x.v }));
+  section("Reality Check · leaders picking each commitment", { a: "Commitment", b: "Leaders" });
+  deck.COMMITMENTS.map(c => ({ l: c.label, v: agg[5].tally.commitments?.[c.key] || 0 })).sort((x, y) => y.v - x.v)
+    .forEach(x => tot.addRow({ a: x.l, b: x.v }));
+  tot.getRow(1).font = { bold: true, size: 13, color: { argb: XL.W } };
+
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+/** Facilitator-only Excel download of every answer. */
+app.post("/api/export/xlsx", async (req, res) => {
+  const { code, token } = req.body || {};
+  const s = sessions[code];
+  if (!isHost(s, token)) return res.status(403).json({ error: "Only the facilitator can download the data." });
+  try {
+    const buf = await buildWorkbook(s);
+    const d = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="RISE-Alignment_responses_${s.code}_${d}.xlsx"`);
+    res.send(buf);
+    console.log(`[export] ${code} — xlsx`);
+  } catch (err) {
+    console.error("Export error:", err);
+    res.status(500).json({ error: `Could not build the file: ${err.message}` });
+  }
 });
 
 /* ─────────────────────────────────────────────────────────────────────────────
