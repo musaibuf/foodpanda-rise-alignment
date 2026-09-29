@@ -422,7 +422,7 @@ function Donut({ data, size = 190 }) {
 /* ─────────────────────────────────────────────────────────────────────────────
    6 · PRESENTATIONS  (built on the server from live data; the browser only downloads)
 ───────────────────────────────────────────────────────────────────────────── */
-const HostCtx = createContext({ code:"", token:"", resetTick:0 });
+const HostCtx = createContext({ code:"", token:"", resetTick:0, openDeck:()=>{} });
 
 /** POSTs to the server and saves the file it returns, keeping the server's filename. */
 async function downloadFile(path, body, fallbackName) {
@@ -1081,12 +1081,12 @@ function Dashboard({ onExit }) {
   }
 
   const joinLink = `${JOIN_URL}/?s=${state.code}`;
-  const answered = ACTIVITIES.filter(a => (data[a.id]?.count || 0) > 0).length;
-  const deckReady = answered === ACTIVITIES.length && !state.liveActivity;
+  const a4n = data[4]?.count || 0;
+  const deckReady = a4n > 0 && state.liveActivity !== 4;
   if (qr) return <QrPresent code={state.code} link={joinLink} count={state.participants?.length || 0} onClose={()=>setQr(false)} />;
 
   return (
-    <HostCtx.Provider value={{ code, token, resetTick }}>
+    <HostCtx.Provider value={{ code, token, resetTick, openDeck: () => setPanel("deck") }}>
     <Box sx={{ minHeight:"100vh", background:CANVAS }}>
       <BrandBar dark right={
         <Stack direction="row" spacing={1.2} alignItems="center">
@@ -1095,7 +1095,7 @@ function Dashboard({ onExit }) {
             label={`${state.participants?.length || 0} in the room`}
             sx={{ background:"rgba(255,255,255,0.08)", color:"#fff", fontWeight:700 }} />
           <Button size="small" variant="contained" startIcon={<QrCode2Icon/>} onClick={()=>setQr(true)}>Show QR</Button>
-          <Tooltip describeChild title={deckReady ? "All seven activities are done" : `${answered} of 7 activities have answers`}>
+          <Tooltip describeChild title={deckReady ? `Builds the 7-slide deck from ${a4n} Activity 4 ${a4n === 1 ? "answer" : "answers"}` : a4n ? "Close Activity 4 first" : "Needs Activity 4 answers first"}>
             <Button size="small" startIcon={<SlideshowIcon/>} onClick={()=>setPanel(panel === "deck" ? "results" : "deck")}
               variant={deckReady || panel === "deck" ? "contained" : "outlined"}
               sx={deckReady || panel === "deck"
@@ -1178,12 +1178,23 @@ function Dashboard({ onExit }) {
   );
 }
 
-/** Final deck: every activity, built from the live answers. */
+const SEVEN_SLIDES = [
+  "What you told us",
+  "Where the room agrees",
+  "Function by function",
+  "Where decisions get stuck",
+  "Unique to one function",
+  "How do we cater to these?",
+  "What your teams are waiting to hear",
+];
+
+/** The 7-slide "What you told us" deck from the brief, built from Activity 4 answers. */
 function PresentationPanel({ state, data, onBack }) {
-  const deck = useDeck("session");
-  const rows = ACTIVITIES.map(a => ({ ...a, n: data[a.id]?.count || 0 }));
-  const answered = rows.filter(r => r.n > 0).length;
-  const live = state.liveActivity ? byId(state.liveActivity) : null;
+  const deck = useDeck("a4");
+  const rows = data[4]?.rows || [];
+  const n = rows.length;
+  const functions = [...new Set(rows.map(r => r.answers?.fn).filter(Boolean))];
+  const a4Live = state.liveActivity === 4;
 
   return (
     <Stack spacing={2.5}>
@@ -1191,21 +1202,22 @@ function PresentationPanel({ state, data, onBack }) {
         <Button size="small" startIcon={<ArrowBackIcon/>} onClick={onBack} sx={{ color:MUTED, ml:-1, mb:1.2 }}>Live results</Button>
         <Box sx={{ display:"flex", alignItems:"flex-start", gap:2.5, flexWrap:"wrap" }}>
           <Box sx={{ flex:1, minWidth:260 }}>
-            <SectionTag>Session presentation</SectionTag>
-            <Typography variant="h5" sx={{ mt:0.6, mb:0.8 }}>Generate the presentation</Typography>
+            <SectionTag>Make presentation</SectionTag>
+            <Typography variant="h5" sx={{ mt:0.6, mb:0.8 }}>What you told us · 7 slides</Typography>
             <Typography sx={{ color:MUTED, fontSize:"0.9rem", lineHeight:1.75, maxWidth:560 }}>
-              One deck from every activity, in RISE Alignment branding. Every number comes straight from the answers;
-              Claude writes the headlines. Activity 4 follows its seven-slide spec and reuses the wording from the break.
+              Built from the Activity 4 answers, slide by slide to the brief. Claude reads every answer and writes the
+              wording; every count comes straight from the data.
             </Typography>
           </Box>
-          <DeckButtons deck={deck} label="Generate presentation" disabled={answered === 0} />
+          <DeckButtons deck={deck} label="Make presentation" disabled={n === 0} />
         </Box>
 
-        {live && (
+        {(a4Live || n === 0) && (
           <Box sx={{ mt:2.2, p:1.6, borderRadius:2.5, background:"#FFF1DC", display:"flex", gap:1.2, alignItems:"center" }}>
             <WarningAmberIcon sx={{ fontSize:18, color:"#C77700" }} />
             <Typography sx={{ fontSize:"0.85rem", color:"#6B4200", fontWeight:600 }}>
-              Activity {live.id} is still open. Close it first so late answers make it into the deck.
+              {n === 0 ? "No Activity 4 answers yet. Run Activity 4 first."
+                       : "Activity 4 is still open. Close it first so late answers make it into the deck."}
             </Typography>
           </Box>
         )}
@@ -1215,20 +1227,17 @@ function PresentationPanel({ state, data, onBack }) {
       </Paper>
 
       <Paper elevation={1} sx={{ p:3, border:`1px solid ${LINE}` }}>
-        <Box sx={{ display:"flex", alignItems:"center", gap:1.2, mb:2 }}>
-          <SectionTag>What goes in</SectionTag>
-          <Chip size="small" label={`${answered} of ${ACTIVITIES.length} with answers`}
-            sx={{ background: answered === ACTIVITIES.length ? "#E3F5EB" : BLUSH, color: answered === ACTIVITIES.length ? "#1E6B45" : MAROON }} />
+        <Box sx={{ display:"flex", alignItems:"center", gap:1.2, mb:2, flexWrap:"wrap" }}>
+          <SectionTag>The seven slides</SectionTag>
+          <Chip size="small" label={`${n} ${n === 1 ? "leader" : "leaders"} · ${functions.length} ${functions.length === 1 ? "function" : "functions"}`}
+            sx={{ background: n ? "#E3F5EB" : BLUSH, color: n ? "#1E6B45" : MAROON }} />
         </Box>
         <Stack spacing={0.8}>
-          {rows.map(r => (
-            <Box key={r.id} sx={{ display:"flex", alignItems:"center", gap:1.5, py:0.9, borderBottom:`1px solid ${LINE}` }}>
+          {SEVEN_SLIDES.map((t, i) => (
+            <Box key={t} sx={{ display:"flex", alignItems:"center", gap:1.5, py:0.9, borderBottom:`1px solid ${LINE}` }}>
               <Box sx={{ width:26, height:26, borderRadius:"8px", display:"grid", placeItems:"center", flexShrink:0,
-                background: r.n ? PINK : "#F0E9EC", color: r.n ? MAROON : MUTED, fontWeight:800, fontSize:"0.8rem" }}>{r.id}</Box>
-              <Typography sx={{ flex:1, fontSize:"0.9rem", fontWeight:600, color: r.n ? INK : MUTED }}>{r.name}</Typography>
-              <Typography sx={{ fontSize:"0.8rem", color:MUTED, fontVariantNumeric:"tabular-nums" }}>{r.n} {r.n === 1 ? "answer" : "answers"}</Typography>
-              <Chip size="small" label={r.n ? "In" : "Left out"}
-                sx={{ minWidth:64, background: r.n ? "#E3F5EB" : "#F0E9EC", color: r.n ? "#1E6B45" : MUTED }} />
+                background: i === 5 ? INK : PINK, color: i === 5 ? "#fff" : MAROON, fontWeight:800, fontSize:"0.8rem" }}>{i + 1}</Box>
+              <Typography sx={{ flex:1, fontSize:"0.9rem", fontWeight:600, color:INK }}>{t}</Typography>
             </Box>
           ))}
         </Stack>
@@ -1430,7 +1439,7 @@ function ResultBody({ activity, data, liveRound }) {
 }
 
 function DeckPanel({ rows, count }) {
-  const deck = useDeck("a4");
+  const host = useContext(HostCtx);
 
   const byFunction = useMemo(() => {
     const m = {};
@@ -1452,16 +1461,15 @@ function DeckPanel({ rows, count }) {
         <Box sx={{ display:"flex", alignItems:"center", gap:2, flexWrap:"wrap" }}>
           <Box sx={{ flex:1, minWidth:240 }}>
             <SectionTag>Not shown in the room</SectionTag>
-            <Typography variant="h6" sx={{ mt:0.6, mb:0.8 }}>Build the "What you told us" deck</Typography>
+            <Typography variant="h6" sx={{ mt:0.6, mb:0.8 }}>These answers become the 7-slide deck</Typography>
             <Typography sx={{ color:MUTED, fontSize:"0.88rem", lineHeight:1.7 }}>
-              Seven slides from these answers, in session branding. Run this at the break.
+              Close Activity 4 at the break, then make the presentation.
             </Typography>
           </Box>
-          <DeckButtons deck={deck} label="Generate deck" disabled={count === 0} />
+          <Button variant="contained" size="large" startIcon={<SlideshowIcon/>} onClick={host.openDeck} disabled={count === 0}>
+            Make presentation
+          </Button>
         </Box>
-        <DeckProgress deck={deck} />
-        {deck.err && <Typography sx={{ color:FLAME, fontSize:"0.85rem", mt:2, fontWeight:600 }}>{deck.err}</Typography>}
-        <DeckResult res={deck.res} />
       </Paper>
 
       <Box sx={{ display:"grid", gap:2.5, gridTemplateColumns:{ xs:"1fr", md:"1fr 1fr" } }}>

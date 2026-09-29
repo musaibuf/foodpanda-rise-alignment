@@ -619,6 +619,25 @@ function redactStats(st) {
   return { ...st, a1: r(st.a1), a6: r(st.a6), a7: r(st.a7), a4: { ...st.a4, rows: r(st.a4.rows), perFunction: r(st.a4.perFunction) } };
 }
 
+/** Escapes raw line breaks and tabs that appear inside JSON strings (a common model slip). */
+function repairJSON(t) {
+  let out = "", inStr = false, esc = false;
+  for (const ch of t) {
+    if (inStr) {
+      if (esc) { esc = false; out += ch; continue; }
+      if (ch === "\\") { esc = true; out += ch; continue; }
+      if (ch === '"') { inStr = false; out += ch; continue; }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") continue;
+      if (ch === "\t") { out += " "; continue; }
+      out += ch; continue;
+    }
+    if (ch === '"') inStr = true;
+    out += ch;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");     // trailing commas
+}
+
 function extractJSON(text) {
   const t = String(text || "").replace(/```json|```/gi, "");
   const start = t.indexOf("{");
@@ -629,22 +648,88 @@ function extractJSON(text) {
     if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
     if (ch === '"') inStr = true;
     else if (ch === "{") depth++;
-    else if (ch === "}" && --depth === 0) { try { return JSON.parse(t.slice(start, i + 1)); } catch { return null; } }
+    else if (ch === "}" && --depth === 0) {
+      const raw = t.slice(start, i + 1);
+      try { return JSON.parse(raw); } catch { try { return JSON.parse(repairJSON(raw)); } catch { return null; } }
+    }
   }
   return null;
 }
 
-async function askJSON(system, user, maxTokens) {
+/**
+ * Asks Claude for structured output through a forced tool call, so the API returns
+ * parsed JSON that matches the schema. Plain-text JSON is only a fallback.
+ */
+async function askJSON(system, user, maxTokens, tool) {
   let lastErr = "no response";
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const msg = await anthropic.messages.create({ model: MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] });
+      const msg = await anthropic.messages.create({
+        model: MODEL, max_tokens: maxTokens, system,
+        messages: [{ role: "user", content: user }],
+        tools: [tool], tool_choice: { type: "tool", name: tool.name },
+      });
+      const call = msg.content.find(c => c.type === "tool_use" && c.name === tool.name);
+      if (call && call.input && typeof call.input === "object") return call.input;
       const j = extractJSON(msg.content.map(c => c.text || "").join(""));
       if (j) return j;
-      lastErr = "reply was not valid JSON";
+      lastErr = msg.stop_reason === "max_tokens" ? "reply was cut off (too long)" : "reply had no usable content";
     } catch (e) { lastErr = e.message; }
   }
   throw new Error(lastErr);
+}
+
+const str = (description) => ({ type: "string", description });
+const A4_TOOL = {
+  name: "write_what_you_told_us",
+  description: "Write the wording for the seven-slide What you told us deck.",
+  input_schema: {
+    type: "object",
+    properties: {
+      summary: str("Five short lines, separated by newline characters, for the facilitator to sanity check before sharing."),
+      s3_headline: str("One sentence, at most 9 words, on the overall pattern across functions."),
+      s3_good: {
+        type: "array", description: "Exactly one entry for every function listed.",
+        items: { type: "object", properties: { function: str("Exact function name as given"),
+          good: str("What good looks like in that function, at most 6 words, from its example") }, required: ["function", "good"] },
+      },
+      s4_headline: str("One sentence, at most 12 words, naming the most common way decisions got stuck (question 5)."),
+      s4_themes: {
+        type: "array", description: "Two or three themes. No function names.",
+        items: { type: "object", properties: { title: str("At most 4 words"), line: str("One line of explanation, at most 12 words"),
+          functions: { type: "integer", description: "How many functions described this" } }, required: ["title", "line", "functions"] },
+      },
+      s5_outliers: {
+        type: "array", description: "Zero to three genuine outliers from question 3 or an unusual question 5 situation.",
+        items: { type: "object", properties: { function: str("Exact function name as given"), need: str("The need in one line, at most 12 words") },
+          required: ["function", "need"] },
+      },
+      s5_none_line: str("One line to use if there are no real outliers, otherwise an empty string."),
+      s7_headline: str("One sentence, at most 12 words, naming the strongest theme in what teams need to hear (question 6). No function names."),
+      s7_messages: { type: "array", description: "Three to five grouped messages, each at most 14 words, no function names.", items: { type: "string" } },
+    },
+    required: ["summary", "s3_headline", "s3_good", "s4_headline", "s4_themes", "s5_outliers", "s5_none_line", "s7_headline", "s7_messages"],
+  },
+};
+const SESSION_TOOL = {
+  name: "write_session_headlines",
+  description: "Write headlines for the session results deck.",
+  input_schema: {
+    type: "object",
+    properties: {
+      a1_headline: str("One sentence, at most 12 words, stating the common thread in the 2027 headlines."),
+      a1_picks: { type: "array", items: { type: "integer" }, description: "Numbers of the three strongest, most distinct headlines; prefer shorter ones." },
+      a6_headline: str("One sentence, at most 12 words, naming the strongest theme in the questions."),
+      a7_headline: str("One sentence, at most 12 words, naming the most common kind of change leaders committed to."),
+    },
+    required: ["a1_headline", "a1_picks", "a6_headline", "a7_headline"],
+  },
+};
+/** s3_good arrives as a list from the tool; the deck wants a map keyed by function. */
+function normaliseA4(j) {
+  const out = { ...j };
+  if (Array.isArray(j.s3_good)) out.s3_good = Object.fromEntries(j.s3_good.filter(x => x && x.function).map(x => [x.function, x.good]));
+  return out;
 }
 
 const HOUSE_RULES = `- Use only what is in the answers. Do not invent examples, numbers or themes.
@@ -660,11 +745,11 @@ Rules:
 ${HOUSE_RULES}
 - The fields for slides 4 and 7 must not contain any function name.
 
-Return ONLY valid JSON, no markdown, in exactly this shape:
+Reply by calling the write_what_you_told_us tool. The fields are described below for reference:
 {
   "summary": "Five short lines separated by \\n, for the facilitator to sanity check before sharing.",
   "s3_headline": "One sentence, at most 9 words, on the overall pattern across functions.",
-  "s3_good": { "<exact function name>": "What good looks like in that function, at most 6 words, drawn from its example" },
+  "s3_good": [ { "function": "<exact function name>", "good": "What good looks like in that function, at most 6 words" } ],
   "s4_headline": "One sentence, at most 12 words, naming the most common way decisions got stuck (question 5).",
   "s4_themes": [ { "title": "At most 4 words", "line": "One line of explanation, at most 12 words", "functions": 3 } ],
   "s5_outliers": [ { "function": "<exact function name>", "need": "The need in one line, at most 12 words" } ],
@@ -703,7 +788,7 @@ const SESSION_SYSTEM = `You write short wording for a results deck from a foodpa
 Rules:
 ${HOUSE_RULES}
 
-Return ONLY valid JSON, no markdown, in exactly this shape:
+Reply by calling the write_session_headlines tool:
 {
   "a1_headline": "One sentence, at most 12 words, stating the common thread in the 2027 headlines.",
   "a1_picks": [0, 1, 2],
@@ -792,12 +877,12 @@ app.post("/api/deck/generate", async (req, res) => {
     let sessAi = {};
     const jobs = [];
     if (st.a4.n && !a4ai) {
-      jobs.push(askJSON(A4_SYSTEM, a4Prompt(st), 6000)
-        .then(j => { a4ai = redactDeep(j); s.decks.a4ai = { fp, ai: a4ai }; })
+      jobs.push(askJSON(A4_SYSTEM, a4Prompt(st), 8000, A4_TOOL)
+        .then(j => { a4ai = redactDeep(normaliseA4(j)); s.decks.a4ai = { fp, ai: a4ai }; })
         .catch(e => { aiErrors.push(`Activity 4: ${e.message}`); a4ai = {}; }));
     }
     if (kind === "session" && (st.a1.length || st.a6.length || st.a7.length)) {
-      jobs.push(askJSON(SESSION_SYSTEM, sessionPrompt(st), 1500)
+      jobs.push(askJSON(SESSION_SYSTEM, sessionPrompt(st), 2000, SESSION_TOOL)
         .then(j => { sessAi = redactDeep(j); })
         .catch(e => aiErrors.push(`Headlines: ${e.message}`)));
     }

@@ -411,6 +411,7 @@ function headlineFit(text, { w = CW, max = 26, min = 20, maxLines = 2 } = {}) {
 }
 const measureHeadline = headlineFit;
 function headline(D, s, text, { w = CW, max = 26, min = 20, color, maxLines = 2 } = {}) {
+  text = String(text ?? "").trim().replace(/(?<!\.)\.$/, "");   // slide headlines carry no full stop
   const f = headlineFit(text, { w, max, min, maxLines });
   const r = put(D, s, f.text, {
     x: MX, y: HEADLINE_Y, w, h: 0.96, face: HEAD, bold: true, max: f.pt, min: f.pt, maxLines,
