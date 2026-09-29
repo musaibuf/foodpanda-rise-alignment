@@ -30,7 +30,6 @@ import CloseIcon            from "@mui/icons-material/Close";
 import PeopleAltIcon        from "@mui/icons-material/PeopleAlt";
 import AutoAwesomeIcon      from "@mui/icons-material/AutoAwesome";
 import VisibilityIcon       from "@mui/icons-material/Visibility";
-import RefreshIcon          from "@mui/icons-material/Refresh";
 import LogoutIcon           from "@mui/icons-material/Logout";
 import RestartAltIcon       from "@mui/icons-material/RestartAlt";
 import DownloadIcon         from "@mui/icons-material/Download";
@@ -263,22 +262,30 @@ function FoodpandaLogo({ height = 28, color = INK, showWord = true }) {
 }
 
 function CarnelianLogo({ height = 30, invert = false }) {
+  // On the dark bar the logo sits on a white chip so it keeps its own colours.
+  // Never filter it: brightness(0) invert(1) flattens the mark into a white blob.
   return (
-    <Box sx={{ display:"flex", alignItems:"center", gap:1.2 }}>
+    <Box sx={{ display:"flex", alignItems:"center", gap:1.1 }}>
       <Typography sx={{
-        fontSize:"0.64rem", lineHeight:1, fontWeight:700, letterSpacing:"0.1em",
-        textTransform:"uppercase", color: invert ? "rgba(255,255,255,0.5)" : MUTED, whiteSpace:"nowrap",
+        fontSize:"0.62rem", lineHeight:1, fontWeight:700, letterSpacing:"0.1em",
+        textTransform:"uppercase", color: invert ? "rgba(255,255,255,0.45)" : MUTED, whiteSpace:"nowrap",
       }}>
         Powered by
       </Typography>
-      <Box component="img" src="/logo.png" alt="Carnelian"
-        sx={{ height, width:"auto", display:"block", filter: invert ? "brightness(0) invert(1)" : "none",
-          opacity: invert ? 0.92 : 1 }}
-        onError={(e)=>{ e.target.style.display="none"; e.target.nextSibling && (e.target.nextSibling.style.display="block"); }} />
-      <Typography sx={{ display:"none", fontWeight:800, fontSize: height * 0.55, letterSpacing:"-0.02em",
-        color: invert ? "#fff" : INK }}>
-        Carnelian
-      </Typography>
+      <Box sx={{
+        display:"flex", alignItems:"center", borderRadius:"10px",
+        ...(invert && { background:"#fff", px:1, py:0.6, boxShadow:"0 1px 6px rgba(0,0,0,0.25)" }),
+      }}>
+        <Box component="img" src="/logo.png" alt="Carnelian"
+          sx={{ height, width:"auto", display:"block" }}
+          onError={(e)=>{
+            e.target.style.display = "none";
+            if (e.target.nextSibling) e.target.nextSibling.style.display = "block";
+          }} />
+        <Typography sx={{ display:"none", fontWeight:800, fontSize: height * 0.6, letterSpacing:"-0.02em", color:INK }}>
+          Carnelian
+        </Typography>
+      </Box>
     </Box>
   );
 }
@@ -1072,12 +1079,18 @@ function Dashboard({ onExit }) {
             label={`${state.participants?.length || 0} in the room`}
             sx={{ background:"rgba(255,255,255,0.08)", color:"#fff", fontWeight:700 }} />
           <Button size="small" variant="contained" startIcon={<QrCode2Icon/>} onClick={()=>setQr(true)}>Show QR</Button>
-          <Tooltip title="Reset — clear all answers, keep the room">
-            <IconButton size="small" onClick={resetSession} sx={{ color:"rgba(255,255,255,0.45)", "&:hover":{ color:"#fff" } }}><RestartAltIcon fontSize="small"/></IconButton>
-          </Tooltip>
-          <Tooltip title="End session">
-            <IconButton size="small" onClick={endSession} sx={{ color:"rgba(255,255,255,0.45)", "&:hover":{ color:FLAME } }}><CloseIcon fontSize="small"/></IconButton>
-          </Tooltip>
+          <Box sx={{ width:"1px", height:22, background:"rgba(255,255,255,0.15)", mx:0.5 }} />
+          {/* Destructive. Labelled in words so neither can be mistaken for a refresh. */}
+          <Button size="small" startIcon={<RestartAltIcon sx={{ fontSize:"16px !important" }}/>} onClick={resetSession}
+            sx={{ color:"rgba(255,255,255,0.4)", fontSize:"0.72rem", minWidth:0, px:1,
+              "&:hover":{ color:"#FFB84D", background:"rgba(255,184,77,0.08)" } }}>
+            Reset
+          </Button>
+          <Button size="small" startIcon={<CloseIcon sx={{ fontSize:"16px !important" }}/>} onClick={endSession}
+            sx={{ color:"rgba(255,255,255,0.4)", fontSize:"0.72rem", minWidth:0, px:1,
+              "&:hover":{ color:FLAME, background:"rgba(232,25,58,0.10)" } }}>
+            End
+          </Button>
         </Stack>
       } />
 
@@ -1085,10 +1098,7 @@ function Dashboard({ onExit }) {
         maxWidth:1480, mx:"auto", px:{ xs:2, md:3 }, py:3, gap:3 }}>
 
         <Paper elevation={1} sx={{ p:2.2, border:`1px solid ${LINE}`, position:{ lg:"sticky" }, top:16 }}>
-          <Box sx={{ display:"flex", alignItems:"center", justifyContent:"space-between", mb:0.4 }}>
-            <SectionTag>Room code</SectionTag>
-            <Tooltip title="Force refresh"><IconButton size="small" onClick={()=>socket.emit("host:resume",{code,token})}><RefreshIcon sx={{ fontSize:16, color:MUTED }}/></IconButton></Tooltip>
-          </Box>
+          <SectionTag>Room code</SectionTag>
           <Typography sx={{ fontWeight:800, fontSize:"2.4rem", letterSpacing:"0.24em", color:INK, lineHeight:1.1, mb:2.4 }}>
             {state.code}
           </Typography>
